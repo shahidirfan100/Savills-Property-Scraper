@@ -1,4 +1,4 @@
-// Savills Commercial Property Scraper - Simplified with Fixed Field Mappings
+// Savills Commercial Property Scraper - URL-based
 import { Actor, log } from 'apify';
 import { CheerioCrawler, Dataset } from 'crawlee';
 import { HeaderGenerator } from 'header-generator';
@@ -9,38 +9,13 @@ async function main() {
     try {
         const input = (await Actor.getInput()) || {};
         const {
-            start_url,
-            location = 'europe',
-            property_type = '',
-            min_price,
-            max_price,
-            currency = 'EUR',
+            start_url = 'https://search.savills.com/com/en/list/commercial/property-for-sale/europe',
             results_wanted: RESULTS_WANTED_RAW = 20,
             proxyConfiguration,
         } = input;
 
         const RESULTS_WANTED = Number.isFinite(+RESULTS_WANTED_RAW) ? Math.max(1, +RESULTS_WANTED_RAW) : 20;
 
-        /**
-         * Build Savills search URL from filter parameters
-         */
-        function buildSearchUrl() {
-            if (start_url) return start_url;
-
-            const params = new URLSearchParams();
-            params.set('Category', 'GRS_CAT_COM');
-            params.set('Tenure', 'GRS_T_B');
-
-            if (location) params.set('LocationKey', location.toLowerCase());
-            if (property_type) params.set('CommercialPropertyType', property_type);
-            if (min_price) params.set('MinPrice', String(min_price));
-            if (max_price) params.set('MaxPrice', String(max_price));
-            if (currency) params.set('Currency', currency);
-
-            return `https://search.savills.com/com/en/list?${params.toString()}`;
-        }
-
-        const initialUrl = buildSearchUrl();
         log.info(`Savills scraper started. Target: ${RESULTS_WANTED} properties`);
 
         const headerGenerator = new HeaderGenerator({
@@ -66,55 +41,42 @@ async function main() {
         function isPostalCode(str) {
             if (!str) return false;
             const trimmed = str.trim();
-            // UK postcodes: PE1 5YS, SW1A 1AA
             if (/^[A-Z]{1,2}\d{1,2}[A-Z]?\s*\d[A-Z]{2}$/i.test(trimmed)) return true;
-            // French/European: 69570, 75001
             if (/^\d{4,5}$/.test(trimmed)) return true;
-            // With city: "69570 DARDILLY" - starts with 4-5 digits
             if (/^\d{4,5}\s+/i.test(trimmed)) return true;
-            // German: 10115
-            if (/^\d{5}$/.test(trimmed)) return true;
             return false;
         }
 
         /**
-         * Clean city name - remove postal codes and clean up
+         * Clean city name - remove postal codes
          */
         function cleanCityName(str) {
             if (!str) return null;
             let cleaned = str.trim();
-            // Remove leading postal codes like "69570 DARDILLY" -> "DARDILLY"
             cleaned = cleaned.replace(/^\d{4,5}\s+/i, '');
-            // Remove trailing postal codes
             cleaned = cleaned.replace(/\s+[A-Z]{1,2}\d{1,2}[A-Z]?\s*\d[A-Z]{2}$/i, '');
             cleaned = cleaned.replace(/\s+\d{4,5}$/i, '');
-            // If it's still just a postal code, return null
             if (isPostalCode(cleaned)) return null;
-            // Clean up and return
             return cleaned.trim() || null;
         }
 
         /**
-         * Extract city from address - improved to handle postal codes
+         * Extract city from address
          */
         function extractCity(prop) {
-            // Try direct City field first
             if (prop.City && typeof prop.City === 'string') {
                 const city = cleanCityName(prop.City);
                 if (city) return city;
             }
 
-            // Try AddressLine2 - often has city but may have postal code
             if (prop.AddressLine2) {
                 const parts = prop.AddressLine2.split(',').map(p => p.trim());
-                // Try each part from end to start, skip postal codes
                 for (let i = parts.length - 1; i >= 0; i--) {
                     const city = cleanCityName(parts[i]);
                     if (city && !isPostalCode(city)) return city;
                 }
             }
 
-            // Try AddressLine1 as fallback
             if (prop.AddressLine1) {
                 const parts = prop.AddressLine1.split(',').map(p => p.trim());
                 for (let i = parts.length - 1; i >= 0; i--) {
@@ -126,9 +88,6 @@ async function main() {
             return null;
         }
 
-        /**
-         * Country code to name mapping
-         */
         const COUNTRY_MAP = {
             'ES': 'Spain', 'GB': 'United Kingdom', 'FR': 'France',
             'DE': 'Germany', 'IT': 'Italy', 'NL': 'Netherlands',
@@ -137,12 +96,14 @@ async function main() {
             'SE': 'Sweden', 'DK': 'Denmark', 'NO': 'Norway',
             'FI': 'Finland', 'GR': 'Greece', 'CZ': 'Czech Republic',
             'HU': 'Hungary', 'RO': 'Romania', 'SK': 'Slovakia',
-            'LU': 'Luxembourg', 'MC': 'Monaco', 'MT': 'Malta'
+            'LU': 'Luxembourg', 'MC': 'Monaco', 'MT': 'Malta',
+            'AE': 'United Arab Emirates', 'SA': 'Saudi Arabia',
+            'QA': 'Qatar', 'KW': 'Kuwait', 'BH': 'Bahrain',
+            'OM': 'Oman', 'US': 'United States', 'AU': 'Australia',
+            'SG': 'Singapore', 'HK': 'Hong Kong', 'JP': 'Japan',
+            'CN': 'China', 'IN': 'India', 'TH': 'Thailand'
         };
 
-        /**
-         * Extract country from GeoLocationCountryCode
-         */
         function extractCountry(prop) {
             if (prop.GeoLocationCountryCode) {
                 const code = prop.GeoLocationCountryCode.toUpperCase();
@@ -152,9 +113,6 @@ async function main() {
             return null;
         }
 
-        /**
-         * Extract country code
-         */
         function extractCountryCode(prop) {
             if (prop.GeoLocationCountryCode) {
                 return prop.GeoLocationCountryCode.toUpperCase();
@@ -162,9 +120,6 @@ async function main() {
             return null;
         }
 
-        /**
-         * Extract description from LongDescription array
-         */
         function extractDescription(prop) {
             if (Array.isArray(prop.LongDescription)) {
                 const bodies = prop.LongDescription
@@ -178,9 +133,6 @@ async function main() {
             return null;
         }
 
-        /**
-         * Extract property type from PropertyTypes array
-         */
         function extractPropertyType(prop) {
             if (Array.isArray(prop.PropertyTypes) && prop.PropertyTypes.length > 0) {
                 return prop.PropertyTypes.map(pt => pt?.Caption || pt?.Name || '').filter(Boolean).join(', ') || null;
@@ -189,9 +141,6 @@ async function main() {
             return null;
         }
 
-        /**
-         * Extract properties from __NEXT_DATA__
-         */
         function extractPropertiesFromNextData(nextDataJson) {
             const properties = [];
 
@@ -407,7 +356,7 @@ async function main() {
             },
         });
 
-        await crawler.run([{ url: initialUrl, userData: { pageNo: 1 } }]);
+        await crawler.run([{ url: start_url, userData: { pageNo: 1 } }]);
         log.info(`Completed: ${saved} properties`);
 
     } finally {
