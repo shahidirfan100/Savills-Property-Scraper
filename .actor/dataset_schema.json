@@ -1,0 +1,63 @@
+{
+  "actorSpecification": 1,
+  "fields": {},
+  "views": {
+    "overview": {
+      "title": "Overview",
+      "transformation": {
+        "fields": [
+          "title",
+          "price",
+          "address",
+          "city",
+          "country",
+          "size",
+          "property_type",
+          "agent_name",
+          "url"
+        ]
+      },
+      "display": {
+        "component": "table",
+        "properties": {
+          "title": {
+            "label": "Title",
+            "format": "text"
+          },
+          "price": {
+            "label": "Price",
+            "format": "text"
+          },
+          "address": {
+            "label": "Address",
+            "format": "text"
+          },
+          "city": {
+            "label": "City",
+            "format": "text"
+          },
+          "country": {
+            "label": "Country",
+            "format": "text"
+          },
+          "size": {
+            "label": "Size",
+            "format": "text"
+          },
+          "property_type": {
+            "label": "Type",
+            "format": "text"
+          },
+          "agent_name": {
+            "label": "Agent",
+            "format": "text"
+          },
+          "url": {
+            "label": "URL",
+            "format": "link"
+          }
+        }
+      }
+    }
+  }
+}
