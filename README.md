@@ -1,15 +1,15 @@
 # Savills Commercial Property Scraper
 
-Extract commercial properties for sale from Savills Europe. This scraper automatically collects property listings with complete details including prices, addresses, sizes, and images.
+Extract commercial properties for sale from Savills Europe with advanced filtering options. This scraper automatically collects property listings with complete details including prices, addresses, sizes, and images.
 
 ---
 
 ## Features
 
+- **Advanced Filtering** - Filter by property type, price range, size, location, and currency
 - **Fast Data Extraction** - Efficiently scrapes property listings from Savills search results
 - **Complete Property Details** - Extracts title, price, address, size, type, images, and more
 - **Pagination Support** - Automatically navigates through multiple pages
-- **Flexible Filtering** - Use any Savills search URL with your desired filters
 - **Proxy Support** - Built-in proxy configuration for reliable scraping
 - **Deduplication** - Prevents duplicate properties in output
 
@@ -21,45 +21,85 @@ Extract commercial properties for sale from Savills Europe. This scraper automat
 - **Investment Analysis** - Identify commercial real estate investment opportunities
 - **Market Monitoring** - Track property listings and price changes
 - **Competitor Analysis** - Monitor commercial property availability in target markets
-- **Lead Generation** - Build lists of commercial properties for outreach
 
 ---
 
 ## Input Parameters
 
-| Parameter | Type | Required | Default | Description |
-|-----------|------|----------|---------|-------------|
-| `start_url` | String | Yes | Europe commercial | Savills search URL to scrape |
-| `results_wanted` | Integer | No | 20 | Maximum number of properties to extract |
-| `proxyConfiguration` | Object | No | Residential | Proxy settings for reliable scraping |
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `start_url` | String | - | Custom Savills search URL (overrides filters) |
+| `location` | String | europe | Location to search (e.g., 'london', 'france') |
+| `property_type` | Select | All | Property type filter |
+| `min_price` | Integer | - | Minimum property price |
+| `max_price` | Integer | - | Maximum property price |
+| `currency` | Select | EUR | Currency for prices (EUR, GBP, USD) |
+| `min_size` | Integer | - | Minimum property size |
+| `max_size` | Integer | - | Maximum property size |
+| `size_unit` | Select | sqm | Size unit (sqm or sqft) |
+| `sort_order` | Select | Most Recent | Sort order for results |
+| `results_wanted` | Integer | 20 | Maximum properties to extract |
+
+### Property Types
+
+- Office
+- Retail
+- Industrial
+- Leisure
+- Hotel
+- Healthcare
+- Development Land
+- Investment
+- Serviced Office
+- Other Commercial
 
 ---
 
-## How to Use
+## Example Inputs
 
-1. Go to [Savills Property Search](https://search.savills.com)
-2. Apply your desired filters (location, property type, price range, etc.)
-3. Copy the URL from your browser
-4. Paste the URL into the `start_url` input field
-5. Set your desired `results_wanted` count
-6. Run the scraper
-
----
-
-## Example Input
-
+### Search all European commercial properties
 ```json
 {
-  "start_url": "https://search.savills.com/com/en/list/commercial/property-for-sale/europe",
+  "location": "europe",
   "results_wanted": 50
+}
+```
+
+### Search offices in London, price 1M-5M GBP
+```json
+{
+  "location": "london",
+  "property_type": "GRS_CPT_O",
+  "min_price": 1000000,
+  "max_price": 5000000,
+  "currency": "GBP",
+  "results_wanted": 20
+}
+```
+
+### Search industrial properties 500-2000 sqm
+```json
+{
+  "location": "europe",
+  "property_type": "GRS_CPT_I",
+  "min_size": 500,
+  "max_size": 2000,
+  "size_unit": "SquareMeter",
+  "results_wanted": 30
+}
+```
+
+### Use a custom Savills URL
+```json
+{
+  "start_url": "https://search.savills.com/com/en/list/commercial/property-for-sale/france",
+  "results_wanted": 100
 }
 ```
 
 ---
 
 ## Output Data
-
-Each property in the output contains:
 
 | Field | Description |
 |-------|-------------|
@@ -70,18 +110,15 @@ Each property in the output contains:
 | `address` | Full street address |
 | `city` | City name |
 | `country` | Country |
-| `region` | Region/State |
+| `latitude` / `longitude` | Coordinates |
 | `size` | Property size/area |
+| `size_sqft` / `size_sqm` | Size in specific units |
 | `property_type` | Commercial property type |
-| `bedrooms` | Number of bedrooms (if applicable) |
-| `bathrooms` | Number of bathrooms (if applicable) |
 | `image_url` | Main property image |
 | `images` | All property images |
 | `description` | Property description |
-| `features` | Property features/highlights |
-| `agent` | Listing agent name |
+| `agent_name` / `agent_phone` | Agent contact |
 | `url` | Direct link to property page |
-| `scraped_at` | Timestamp of extraction |
 
 ---
 
@@ -96,14 +133,10 @@ Each property in the output contains:
   "address": "C/ Maria Tubau 4, MADRID",
   "city": "Madrid",
   "country": "Spain",
-  "region": null,
   "size": "6,500 sq m",
   "property_type": "Office",
   "image_url": "https://assets.savills.com/...",
-  "images": ["https://assets.savills.com/..."],
-  "description": "Prime office building in Madrid's business district...",
-  "features": ["Air conditioning", "Parking"],
-  "agent": "Savills Madrid",
+  "agent_name": "Savills Madrid",
   "url": "https://search.savills.com/property/...",
   "scraped_at": "2026-01-17T08:30:00.000Z"
 }
@@ -111,47 +144,14 @@ Each property in the output contains:
 
 ---
 
-## Tips
-
-- **Use Specific URLs** - The more specific your search URL, the more targeted your results
-- **Start Small** - Test with 10-20 results first before running larger extractions
-- **Monitor Rate Limits** - Use reasonable request delays to avoid blocking
-- **Use Proxies** - Enable residential proxies for more reliable scraping
-
----
-
 ## Integrations
 
-Export your data in multiple formats:
-- **JSON** - For programmatic access
-- **CSV** - For spreadsheet analysis
-- **Excel** - For business reporting
+Export your data in multiple formats: JSON, CSV, Excel
 
-Connect to 1000+ apps via Apify integrations:
-- Google Sheets
-- Airtable
-- Slack notifications
-- Webhooks
-- And more...
-
----
-
-## FAQ
-
-**Q: What types of properties can I scrape?**
-A: This scraper works with all commercial properties listed on Savills, including offices, retail, industrial, hotels, and development land.
-
-**Q: Does it work for residential properties?**
-A: While optimized for commercial properties, it can work with residential Savills listings by using the appropriate search URL.
-
-**Q: How many properties can I extract?**
-A: You can extract as many properties as are available on Savills. Set `results_wanted` to your desired limit.
-
-**Q: How often is the data updated?**
-A: The scraper extracts live data from Savills. Run it as often as needed to get fresh data.
+Connect to 1000+ apps via Apify integrations: Google Sheets, Airtable, Slack, Webhooks
 
 ---
 
 ## Legal Notice
 
-This scraper is provided for educational and research purposes. Users are responsible for ensuring their use complies with Savills' terms of service and applicable laws. Always respect website policies and use reasonable request rates.
+This scraper is for educational and research purposes. Users must ensure compliance with Savills' terms of service and applicable laws.

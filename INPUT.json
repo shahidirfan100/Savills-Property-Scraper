@@ -1,4 +1,7 @@
 {
-  "start_url": "https://search.savills.com/com/en/list/commercial/property-for-sale/europe",
+  "start_url": "",
+  "location": "europe",
+  "property_type": "",
+  "currency": "EUR",
   "results_wanted": 20
 }
