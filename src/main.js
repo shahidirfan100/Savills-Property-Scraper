@@ -1,370 +1,664 @@
-// Savills Commercial Property Scraper - URL-based
-import { Actor, log } from 'apify';
-import { CheerioCrawler, Dataset } from 'crawlee';
-import { HeaderGenerator } from 'header-generator';
+import { Actor } from 'apify';
+import log from '@apify/log';
+import { Dataset } from 'crawlee';
+import { gotScraping } from 'got-scraping';
+import { readFile } from 'node:fs/promises';
 
 await Actor.init();
 
-async function main() {
+const DEFAULT_RESULTS_WANTED = 20;
+const API_PAGE_SIZE = 16;
+const REQUEST_TIMEOUT_MS = 30000;
+const EXCLUDED_SOURCE_FIELDS = new Set([
+    'PropertyCardImagesGallery',
+    'ImagesGallery',
+    'BrochureGallery',
+]);
+
+const COUNTRY_MAP = {
+    ES: 'Spain',
+    GB: 'United Kingdom',
+    FR: 'France',
+    DE: 'Germany',
+    IT: 'Italy',
+    NL: 'Netherlands',
+    PT: 'Portugal',
+    BE: 'Belgium',
+    IE: 'Ireland',
+    PL: 'Poland',
+    AT: 'Austria',
+    CH: 'Switzerland',
+    SE: 'Sweden',
+    DK: 'Denmark',
+    NO: 'Norway',
+    FI: 'Finland',
+    GR: 'Greece',
+    CZ: 'Czech Republic',
+    HU: 'Hungary',
+    RO: 'Romania',
+    SK: 'Slovakia',
+    LU: 'Luxembourg',
+    MC: 'Monaco',
+    MT: 'Malta',
+    AE: 'United Arab Emirates',
+    SA: 'Saudi Arabia',
+    QA: 'Qatar',
+    KW: 'Kuwait',
+    BH: 'Bahrain',
+    OM: 'Oman',
+    US: 'United States',
+    AU: 'Australia',
+    SG: 'Singapore',
+    HK: 'Hong Kong',
+    JP: 'Japan',
+    CN: 'China',
+    IN: 'India',
+    TH: 'Thailand',
+};
+
+function hasInputValues(input) {
+    return input && typeof input === 'object' && Object.keys(input).length > 0;
+}
+
+async function loadInputWithFallback() {
+    const runtimeInput = (await Actor.getInput()) || {};
+    if (hasInputValues(runtimeInput)) return runtimeInput;
+
+    const fallbackInput = (await Actor.getValue('INPUT')) || {};
+    if (hasInputValues(fallbackInput)) {
+        log.warning('Actor input is empty. Falling back to INPUT record.');
+        return fallbackInput;
+    }
+
     try {
-        const input = (await Actor.getInput()) || {};
-        const {
-            start_url = 'https://search.savills.com/com/en/list/commercial/property-for-sale/europe',
-            results_wanted: RESULTS_WANTED_RAW = 20,
-            proxyConfiguration,
-        } = input;
-
-        const RESULTS_WANTED = Number.isFinite(+RESULTS_WANTED_RAW) ? Math.max(1, +RESULTS_WANTED_RAW) : 20;
-
-        log.info(`Savills scraper started. Target: ${RESULTS_WANTED} properties`);
-
-        const headerGenerator = new HeaderGenerator({
-            browsers: [
-                { name: 'chrome', minVersion: 120, maxVersion: 130 },
-                { name: 'firefox', minVersion: 115, maxVersion: 125 }
-            ],
-            devices: ['desktop'],
-            operatingSystems: ['windows', 'macos'],
-            locales: ['en-US'],
-        });
-
-        const proxyConf = proxyConfiguration
-            ? await Actor.createProxyConfiguration({ ...proxyConfiguration })
-            : undefined;
-
-        let saved = 0;
-        const seenIds = new Set();
-
-        /**
-         * Check if string looks like a postal/zip code
-         */
-        function isPostalCode(str) {
-            if (!str) return false;
-            const trimmed = str.trim();
-            if (/^[A-Z]{1,2}\d{1,2}[A-Z]?\s*\d[A-Z]{2}$/i.test(trimmed)) return true;
-            if (/^\d{4,5}$/.test(trimmed)) return true;
-            if (/^\d{4,5}\s+/i.test(trimmed)) return true;
-            return false;
+        const localInputRaw = await readFile('INPUT.json', 'utf8');
+        const localInput = JSON.parse(localInputRaw);
+        if (hasInputValues(localInput)) {
+            log.warning('Actor input is empty. Falling back to local INPUT.json.');
+            return localInput;
         }
+    } catch {
+        // INPUT.json fallback is optional for local runs.
+    }
 
-        /**
-         * Clean city name - remove postal codes
-         */
-        function cleanCityName(str) {
-            if (!str) return null;
-            let cleaned = str.trim();
-            cleaned = cleaned.replace(/^\d{4,5}\s+/i, '');
-            cleaned = cleaned.replace(/\s+[A-Z]{1,2}\d{1,2}[A-Z]?\s*\d[A-Z]{2}$/i, '');
-            cleaned = cleaned.replace(/\s+\d{4,5}$/i, '');
-            if (isPostalCode(cleaned)) return null;
-            return cleaned.trim() || null;
-        }
+    return {};
+}
 
-        /**
-         * Extract city from address
-         */
-        function extractCity(prop) {
-            if (prop.City && typeof prop.City === 'string') {
-                const city = cleanCityName(prop.City);
-                if (city) return city;
-            }
+function sanitizeResultsWanted(rawValue) {
+    const parsed = Number(rawValue);
+    if (!Number.isFinite(parsed)) return DEFAULT_RESULTS_WANTED;
+    return Math.max(1, Math.floor(parsed));
+}
 
-            if (prop.AddressLine2) {
-                const parts = prop.AddressLine2.split(',').map(p => p.trim());
-                for (let i = parts.length - 1; i >= 0; i--) {
-                    const city = cleanCityName(parts[i]);
-                    if (city && !isPostalCode(city)) return city;
-                }
-            }
+async function createProxyUrlFactory(proxyConfigurationInput) {
+    if (!proxyConfigurationInput) {
+        return async () => undefined;
+    }
 
-            if (prop.AddressLine1) {
-                const parts = prop.AddressLine1.split(',').map(p => p.trim());
-                for (let i = parts.length - 1; i >= 0; i--) {
-                    const city = cleanCityName(parts[i]);
-                    if (city && !isPostalCode(city)) return city;
-                }
-            }
+    const proxyConfiguration = await Actor.createProxyConfiguration({ ...proxyConfigurationInput });
+    return async () => proxyConfiguration.newUrl();
+}
 
-            return null;
-        }
+async function fetchText(url, getProxyUrl) {
+    const proxyUrl = await getProxyUrl();
+    const response = await gotScraping.get(url, {
+        proxyUrl,
+        timeout: { request: REQUEST_TIMEOUT_MS },
+        headers: {
+            Accept: 'text/html,application/xhtml+xml',
+            'Accept-Language': 'en-US,en;q=0.9',
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:147.0) Gecko/20100101 Firefox/147.0',
+        },
+    });
+    return response.body;
+}
 
-        const COUNTRY_MAP = {
-            'ES': 'Spain', 'GB': 'United Kingdom', 'FR': 'France',
-            'DE': 'Germany', 'IT': 'Italy', 'NL': 'Netherlands',
-            'PT': 'Portugal', 'BE': 'Belgium', 'IE': 'Ireland',
-            'PL': 'Poland', 'AT': 'Austria', 'CH': 'Switzerland',
-            'SE': 'Sweden', 'DK': 'Denmark', 'NO': 'Norway',
-            'FI': 'Finland', 'GR': 'Greece', 'CZ': 'Czech Republic',
-            'HU': 'Hungary', 'RO': 'Romania', 'SK': 'Slovakia',
-            'LU': 'Luxembourg', 'MC': 'Monaco', 'MT': 'Malta',
-            'AE': 'United Arab Emirates', 'SA': 'Saudi Arabia',
-            'QA': 'Qatar', 'KW': 'Kuwait', 'BH': 'Bahrain',
-            'OM': 'Oman', 'US': 'United States', 'AU': 'Australia',
-            'SG': 'Singapore', 'HK': 'Hong Kong', 'JP': 'Japan',
-            'CN': 'China', 'IN': 'India', 'TH': 'Thailand'
-        };
+function extractNextDataFromHtml(html) {
+    const match = html.match(/<script id="__NEXT_DATA__" type="application\/json">([\s\S]*?)<\/script>/i);
+    if (!match) throw new Error('Could not find __NEXT_DATA__ bootstrap payload in start_url HTML.');
 
-        function extractCountry(prop) {
-            if (prop.GeoLocationCountryCode) {
-                const code = prop.GeoLocationCountryCode.toUpperCase();
-                return COUNTRY_MAP[code] || null;
-            }
-            if (prop.Country && typeof prop.Country === 'string') return prop.Country;
-            return null;
-        }
-
-        function extractCountryCode(prop) {
-            if (prop.GeoLocationCountryCode) {
-                return prop.GeoLocationCountryCode.toUpperCase();
-            }
-            return null;
-        }
-
-        function extractDescription(prop) {
-            if (Array.isArray(prop.LongDescription)) {
-                const bodies = prop.LongDescription
-                    .map(d => d?.Body || d?.Text || '')
-                    .filter(Boolean)
-                    .join('\n');
-                if (bodies) return bodies;
-            }
-            if (typeof prop.Description === 'string') return prop.Description;
-            if (typeof prop.ShortDescription === 'string') return prop.ShortDescription;
-            return null;
-        }
-
-        function extractPropertyType(prop) {
-            if (Array.isArray(prop.PropertyTypes) && prop.PropertyTypes.length > 0) {
-                return prop.PropertyTypes.map(pt => pt?.Caption || pt?.Name || '').filter(Boolean).join(', ') || null;
-            }
-            if (typeof prop.PropertyType === 'string') return prop.PropertyType;
-            return null;
-        }
-
-        function extractPropertiesFromNextData(nextDataJson) {
-            const properties = [];
-
-            try {
-                const initialReduxState = nextDataJson?.props?.initialReduxState;
-                if (!initialReduxState) return properties;
-
-                const propertyMap = initialReduxState.properties || {};
-                const pageMap = initialReduxState.listPage?.pageMap || {};
-
-                let propertyIds = [];
-                for (const pageKey of Object.keys(pageMap)) {
-                    const pagePropertyIds = pageMap[pageKey]?.results?.Properties || [];
-                    propertyIds.push(...pagePropertyIds);
-                }
-
-                if (propertyIds.length === 0) {
-                    propertyIds = Object.keys(propertyMap);
-                }
-
-                for (const id of propertyIds) {
-                    if (seenIds.has(id)) continue;
-
-                    const prop = propertyMap[id];
-                    if (!prop) continue;
-
-                    seenIds.add(id);
-
-                    const priceText = prop.DisplayPriceText || prop.GuidePriceText ||
-                        (prop.Price ? `${prop.DisplayCurrency || ''}${prop.Price}` : null);
-
-                    const addressParts = [prop.AddressLine1, prop.AddressLine2].filter(Boolean);
-                    const fullAddress = addressParts.join(', ') || null;
-
-                    const sizeData = prop.AvailableSize || {};
-                    const sizeText = prop.SizeFormatted || prop.HeaderSizeFormatted ||
-                        (sizeData.SqFt ? `${sizeData.SqFt.toLocaleString()} sq ft` :
-                            sizeData.SqMt ? `${sizeData.SqMt.toLocaleString()} sq m` : null);
-
-                    const gallery = prop.ImagesGallery || prop.PropertyCardImagesGallery || [];
-                    const firstImage = gallery[0];
-                    const imageUrl = firstImage?.ImageUrl_L || firstImage?.ImageUrl_M || firstImage?.ImageUrl_S || null;
-
-                    const agent = prop.PrimaryAgent || {};
-                    const agentName = agent.AgentName || agent.Name || null;
-                    const agentPhone = agent.AgentPhoneNumber || agent.Phone || null;
-                    const agentOffice = agent.Office?.OfficeName || agent.OfficeName || null;
-
-                    const propertyPath = prop.PropertyUrl || prop.Url || `/property/${prop.PropertyID || id}`;
-                    const propertyUrl = propertyPath.startsWith('http') ? propertyPath :
-                        `https://search.savills.com${propertyPath.startsWith('/') ? '' : '/'}${propertyPath}`;
-
-                    properties.push({
-                        id: prop.PropertyID || prop.ID || id,
-                        external_id: prop.ExternalPropertyID || null,
-                        title: prop.PropertyPageTitle || prop.Title || prop.AddressLine1 || null,
-                        price: priceText,
-                        currency: prop.DisplayCurrency || null,
-                        address: fullAddress,
-                        city: extractCity(prop),
-                        country: extractCountry(prop),
-                        country_code: extractCountryCode(prop),
-                        latitude: prop.Latitude || null,
-                        longitude: prop.Longitude || null,
-                        size: sizeText,
-                        size_sqft: sizeData.SqFt || null,
-                        size_sqm: sizeData.SqMt || null,
-                        property_type: extractPropertyType(prop),
-                        is_commercial: prop.IsCommercial || false,
-                        is_sold: prop.IsSold || false,
-                        image_url: imageUrl,
-                        images: gallery.map(img => img?.ImageUrl_L || img?.ImageUrl_M).filter(Boolean),
-                        description: extractDescription(prop),
-                        agent_name: agentName,
-                        agent_phone: agentPhone,
-                        agent_office: agentOffice,
-                        url: propertyUrl,
-                        scraped_at: new Date().toISOString(),
-                    });
-                }
-            } catch (err) {
-                log.error(`Extraction error: ${err.message}`);
-            }
-
-            return properties;
-        }
-
-        function getPaginationInfo(nextDataJson) {
-            try {
-                const pageMap = nextDataJson?.props?.initialReduxState?.listPage?.pageMap || {};
-                for (const pageKey of Object.keys(pageMap)) {
-                    const paging = pageMap[pageKey]?.paging;
-                    if (paging) {
-                        return {
-                            current: paging.current || 1,
-                            last: paging.last || 1,
-                            totalItems: paging.totalItems || 0,
-                        };
-                    }
-                }
-            } catch { /* ignore */ }
-            return { current: 1, last: 1, totalItems: 0 };
-        }
-
-        function buildNextPageUrl(baseUrl, nextPage) {
-            try {
-                const url = new URL(baseUrl);
-                if (url.pathname.includes('/list/')) {
-                    url.pathname = url.pathname.replace(/\/page\/\d+$/, '');
-                    url.pathname = `${url.pathname}/page/${nextPage}`.replace(/\/+/g, '/');
-                } else {
-                    url.searchParams.set('Page', String(nextPage));
-                }
-                return url.href;
-            } catch { return null; }
-        }
-
-        const crawler = new CheerioCrawler({
-            proxyConfiguration: proxyConf,
-            maxConcurrency: 3,
-            maxRequestRetries: 5,
-            requestHandlerTimeoutSecs: 60,
-
-            useSessionPool: true,
-            sessionPoolOptions: {
-                maxPoolSize: 50,
-                sessionOptions: {
-                    maxUsageCount: 10,
-                    maxErrorScore: 3,
-                },
-            },
-
-            preNavigationHooks: [
-                async ({ request }) => {
-                    const headers = headerGenerator.getHeaders();
-                    request.headers = {
-                        ...headers,
-                        'sec-ch-ua': '"Chromium";v="122", "Google Chrome";v="122"',
-                        'sec-ch-ua-mobile': '?0',
-                        'sec-ch-ua-platform': '"Windows"',
-                        'sec-fetch-dest': 'document',
-                        'sec-fetch-mode': 'navigate',
-                        'sec-fetch-site': 'none',
-                        'sec-fetch-user': '?1',
-                        'accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-                        'accept-language': 'en-US,en;q=0.9',
-                        'accept-encoding': 'gzip, deflate, br',
-                        'cache-control': 'max-age=0',
-                    };
-
-                    await new Promise(r => setTimeout(r, 1000 + Math.random() * 2000));
-                },
-            ],
-
-            async requestHandler({ $, request, enqueueLinks }) {
-                const pageNo = request.userData?.pageNo || 1;
-
-                const title = $('title').text();
-                if (title.includes('Access Denied') || title.includes('Captcha')) {
-                    log.error('BLOCKED!');
-                    return;
-                }
-
-                const nextDataScript = $('script#__NEXT_DATA__').text();
-                if (!nextDataScript) {
-                    log.warning('No data found on page');
-                    return;
-                }
-
-                let nextDataJson;
-                try {
-                    nextDataJson = JSON.parse(nextDataScript);
-                } catch (err) {
-                    log.error(`Parse error: ${err.message}`);
-                    return;
-                }
-
-                const properties = extractPropertiesFromNextData(nextDataJson);
-
-                if (properties.length === 0) {
-                    log.warning('No properties found');
-                    return;
-                }
-
-                const remaining = RESULTS_WANTED - saved;
-                const toSave = properties.slice(0, Math.max(0, remaining));
-
-                if (toSave.length > 0) {
-                    await Dataset.pushData(toSave);
-                    saved += toSave.length;
-                }
-
-                if (saved >= RESULTS_WANTED) {
-                    log.info(`Done: ${saved} properties saved`);
-                    return;
-                }
-
-                const pagination = getPaginationInfo(nextDataJson);
-
-                if (pageNo < pagination.last) {
-                    const nextPageUrl = buildNextPageUrl(request.url, pageNo + 1);
-                    if (nextPageUrl) {
-                        await enqueueLinks({
-                            urls: [nextPageUrl],
-                            userData: { pageNo: pageNo + 1 },
-                        });
-                    }
-                }
-            },
-
-            failedRequestHandler({ request }, error) {
-                log.error(`Failed: ${error.message}`);
-            },
-        });
-
-        await crawler.run([{ url: start_url, userData: { pageNo: 1 } }]);
-        log.info(`Completed: ${saved} properties`);
-
-    } finally {
-        await Actor.exit();
+    try {
+        return JSON.parse(match[1]);
+    } catch (error) {
+        throw new Error(`Invalid __NEXT_DATA__ JSON payload: ${error.message}`);
     }
 }
 
-main().catch(err => {
-    console.error(err);
-    process.exit(1);
-});
+function getApiBootstrapConfig(nextData, startUrl) {
+    const state = nextData?.props?.initialReduxState;
+    const dataEndpoint = state?.global?.dataEndpoint;
+    const languageCode = state?.global?.localization?.languageCode;
+    const countryCode = state?.global?.localization?.countryCode;
+    const criteria = state?.listPage?.searchedCriteria;
+
+    if (!dataEndpoint || !languageCode || !countryCode || !criteria) {
+        throw new Error('Missing API bootstrap values (dataEndpoint/localization/criteria).');
+    }
+
+    return {
+        dataEndpoint: dataEndpoint.replace(/\/$/, ''),
+        languageCode,
+        countryCode,
+        criteria,
+        startUrl,
+    };
+}
+
+async function fetchSearchPage(bootstrap, pageNumber, getProxyUrl) {
+    const proxyUrl = await getProxyUrl();
+    const response = await gotScraping.post(`${bootstrap.dataEndpoint}/Data/Search`, {
+        proxyUrl,
+        responseType: 'json',
+        timeout: { request: REQUEST_TIMEOUT_MS },
+        headers: {
+            Accept: 'application/json',
+            'Content-Type': 'application/json',
+            GpsLanguageCode: bootstrap.languageCode,
+            GpsCountryCode: bootstrap.countryCode,
+            Origin: 'https://search.savills.com',
+            Referer: bootstrap.startUrl,
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:147.0) Gecko/20100101 Firefox/147.0',
+        },
+        json: {
+            PagingParameters: {
+                CurrentPage: pageNumber,
+                PageSize: API_PAGE_SIZE,
+                ViewAll: false,
+            },
+            Criteria: bootstrap.criteria,
+        },
+    });
+
+    return response.body?.Results || null;
+}
+
+function extractPageCount(results) {
+    const pageCount = Number(results?.PagingInfo?.PageCount ?? results?.paging?.total);
+    if (Number.isFinite(pageCount) && pageCount > 0) return pageCount;
+    return null;
+}
+
+function getFirstPageState(nextData) {
+    const pageMap = nextData?.props?.initialReduxState?.listPage?.pageMap;
+    if (!pageMap || typeof pageMap !== 'object') return null;
+
+    if (pageMap['1']) return pageMap['1'];
+
+    for (const value of Object.values(pageMap)) {
+        if (value && typeof value === 'object') return value;
+    }
+
+    return null;
+}
+
+function extractPageState(nextData, pageNumber) {
+    const pageMap = nextData?.props?.initialReduxState?.listPage?.pageMap;
+    if (!pageMap || typeof pageMap !== 'object') return null;
+    return pageMap[String(pageNumber)] || null;
+}
+
+function extractResultsFromNextData(nextData, pageNumber) {
+    const pageState = extractPageState(nextData, pageNumber) || getFirstPageState(nextData);
+    const results = pageState?.results || null;
+    if (!results?.Properties) return null;
+
+    const pageCount = Number(pageState?.paging?.total);
+    const pageInfo = results.PagingInfo || {};
+
+    return {
+        ...results,
+        PagingInfo: {
+            ...pageInfo,
+            PageCount: Number.isFinite(pageCount) && pageCount > 0 ? pageCount : pageInfo.PageCount,
+        },
+    };
+}
+
+function resolveSavillsUrl(pathOrUrl) {
+    if (!pathOrUrl || typeof pathOrUrl !== 'string') return null;
+    if (/^https?:\/\//i.test(pathOrUrl)) return pathOrUrl;
+    return `https://search.savills.com/${pathOrUrl.replace(/^\/+/, '')}`;
+}
+
+function buildHtmlBaseUrl(nextData, startUrl) {
+    const firstPage = getFirstPageState(nextData);
+    const canonicalUrl = firstPage?.metaData?.CanonicalUrl;
+    const resolvedCanonical = resolveSavillsUrl(canonicalUrl);
+    if (resolvedCanonical) return resolvedCanonical.replace(/\/+$/, '');
+
+    return startUrl.trim()
+        .replace(/\/page\/\d+\/?$/i, '')
+        .replace(/\/+$/, '');
+}
+
+function buildHtmlPageUrl(baseUrl, pageNumber) {
+    if (pageNumber <= 1) return baseUrl;
+    return `${baseUrl.replace(/\/+$/, '')}/page/${pageNumber}`;
+}
+
+async function pushRowsToDataset(rows, resultsWanted, saved, seenKeys) {
+    if (!Array.isArray(rows) || rows.length === 0 || saved >= resultsWanted) return 0;
+
+    const remaining = resultsWanted - saved;
+    const mappedRows = [];
+
+    for (const row of rows) {
+        const mapped = mapPropertyRecord(row);
+        const dedupeKey = mapped.id || mapped.external_id || mapped.url;
+        if (!dedupeKey || seenKeys.has(dedupeKey)) continue;
+
+        seenKeys.add(dedupeKey);
+        mappedRows.push(mapped);
+        if (mappedRows.length >= remaining) break;
+    }
+
+    if (mappedRows.length === 0) return 0;
+
+    await Dataset.pushData(mappedRows);
+    return mappedRows.length;
+}
+
+async function runHtmlPaginationFallback({ startUrl, nextData, getProxyUrl, resultsWanted, saved, seenKeys }) {
+    log.warning('Switching to HTML pagination fallback because API pagination failed.');
+
+    let totalPages = Number.POSITIVE_INFINITY;
+    let page = 1;
+    let currentNextData = nextData;
+    const baseUrl = buildHtmlBaseUrl(nextData, startUrl);
+    let totalSaved = saved;
+
+    while (totalSaved < resultsWanted && page <= totalPages) {
+        if (page > 1) {
+            const pageUrl = buildHtmlPageUrl(baseUrl, page);
+            log.info(`Fetching HTML page ${page}${Number.isFinite(totalPages) ? `/${totalPages}` : ''}`);
+            const pageHtml = await fetchText(pageUrl, getProxyUrl);
+            currentNextData = extractNextDataFromHtml(pageHtml);
+        } else {
+            log.info('Using bootstrap HTML page 1 for fallback extraction');
+        }
+
+        const results = extractResultsFromNextData(currentNextData, page);
+        if (!results?.Properties) {
+            log.warning(`HTML fallback page ${page} has no Properties payload. Stopping fallback.`);
+            break;
+        }
+
+        const pageCount = extractPageCount(results);
+        if (pageCount) totalPages = pageCount;
+
+        const rows = toPropertyRows(results.Properties);
+        if (rows.length === 0) {
+            log.info('No rows found in HTML fallback page. Stopping pagination.');
+            break;
+        }
+
+        const added = await pushRowsToDataset(rows, resultsWanted, totalSaved, seenKeys);
+        if (added > 0) {
+            totalSaved += added;
+            log.info(`Saved ${added} properties via HTML fallback. Total: ${totalSaved}/${resultsWanted}`);
+        }
+
+        if (page >= totalPages) break;
+        page++;
+    }
+
+    return totalSaved;
+}
+
+// Savills returns listing fields as column arrays; this converts columns into row objects.
+function toPropertyRows(columnarProperties) {
+    if (!columnarProperties || typeof columnarProperties !== 'object') return [];
+    if (Array.isArray(columnarProperties)) {
+        return columnarProperties.filter(value => value && typeof value === 'object');
+    }
+
+    const columnNames = Object.keys(columnarProperties);
+    const normalizeColumn = (column) => {
+        if (Array.isArray(column)) return column;
+        if (!column || typeof column !== 'object') return null;
+
+        const numericKeys = Object.keys(column)
+            .filter(key => /^\d+$/.test(key))
+            .sort((a, b) => Number(a) - Number(b));
+
+        if (numericKeys.length === 0) return null;
+        return numericKeys.map(key => column[key]);
+    };
+
+    const normalizedColumns = {};
+    for (const key of columnNames) {
+        normalizedColumns[key] = normalizeColumn(columnarProperties[key]);
+    }
+
+    const totalRows = columnNames.reduce((max, key) => {
+        const value = normalizedColumns[key];
+        return Array.isArray(value) ? Math.max(max, value.length) : max;
+    }, 0);
+
+    const rows = [];
+    for (let index = 0; index < totalRows; index++) {
+        const row = {};
+        let hasValue = false;
+
+        for (const key of columnNames) {
+            const column = normalizedColumns[key];
+            if (!Array.isArray(column)) continue;
+
+            const value = column[index];
+            if (value !== undefined && value !== null && value !== '') {
+                row[key] = value;
+                hasValue = true;
+            }
+        }
+
+        if (hasValue) rows.push(row);
+    }
+
+    return rows;
+}
+
+function isPostalCode(value) {
+    if (!value || typeof value !== 'string') return false;
+    const trimmed = value.trim();
+    if (/^[A-Z]{1,2}\d{1,2}[A-Z]?\s*\d[A-Z]{2}$/i.test(trimmed)) return true;
+    if (/^\d{4,5}$/.test(trimmed)) return true;
+    if (/^\d{4,5}\s+/i.test(trimmed)) return true;
+    return false;
+}
+
+function cleanCityName(value) {
+    if (!value || typeof value !== 'string') return null;
+    let cleaned = value.trim();
+    cleaned = cleaned.replace(/^\d{4,5}\s+/i, '');
+    cleaned = cleaned.replace(/\s+[A-Z]{1,2}\d{1,2}[A-Z]?\s*\d[A-Z]{2}$/i, '');
+    cleaned = cleaned.replace(/\s+\d{4,5}$/i, '');
+    if (isPostalCode(cleaned)) return null;
+    return cleaned.trim() || null;
+}
+
+function extractCity(property) {
+    const candidates = [property.City, property.Location, property.AddressLine2, property.AddressLine1]
+        .filter(value => typeof value === 'string' && value.trim());
+
+    for (const candidate of candidates) {
+        const parts = candidate.split(',').map(part => part.trim());
+        for (let i = parts.length - 1; i >= 0; i--) {
+            const city = cleanCityName(parts[i]);
+            if (city && !isPostalCode(city)) return city;
+        }
+    }
+
+    return null;
+}
+
+function extractCountryCode(property) {
+    if (property.GeoLocationCountryCode) return String(property.GeoLocationCountryCode).toUpperCase();
+    return null;
+}
+
+function extractCountry(property) {
+    const countryCode = extractCountryCode(property);
+    if (countryCode && COUNTRY_MAP[countryCode]) return COUNTRY_MAP[countryCode];
+    if (typeof property.Country === 'string') return property.Country;
+    if (typeof property.Location === 'string') {
+        const parts = property.Location.split(',').map(part => part.trim()).filter(Boolean);
+        if (parts.length > 1) return parts[parts.length - 1];
+    }
+    return null;
+}
+
+function extractDescription(property) {
+    if (Array.isArray(property.LongDescription)) {
+        const text = property.LongDescription
+            .map(item => item?.Body || item?.Text || '')
+            .filter(Boolean)
+            .join('\n');
+        if (text) return text;
+    }
+
+    if (typeof property.Description === 'string') return property.Description;
+    if (typeof property.ShortDescription === 'string') return property.ShortDescription;
+    return null;
+}
+
+function extractPropertyType(property) {
+    if (Array.isArray(property.PropertyTypes) && property.PropertyTypes.length > 0) {
+        return property.PropertyTypes
+            .map(item => item?.Caption || item?.Name || item?.Type || '')
+            .filter(Boolean)
+            .join(', ') || null;
+    }
+
+    if (typeof property.PropertyType === 'string') return property.PropertyType;
+    return null;
+}
+
+function extractImageUrls(property) {
+    const gallery = Array.isArray(property.ImagesGallery) && property.ImagesGallery.length > 0
+        ? property.ImagesGallery
+        : (Array.isArray(property.PropertyCardImagesGallery) ? property.PropertyCardImagesGallery : []);
+
+    const urls = [];
+    for (const image of gallery) {
+        const url = image?.ImageUrl_L || image?.ImageUrl_M || image?.ImageUrl_S || image?.Url || null;
+        if (url) urls.push(url);
+    }
+
+    return [...new Set(urls)];
+}
+
+function extractBrochureUrls(property) {
+    if (!Array.isArray(property.BrochureGallery) || property.BrochureGallery.length === 0) return [];
+
+    const urls = property.BrochureGallery
+        .map(item => item?.ImageUrl || item?.Url || null)
+        .filter(Boolean);
+
+    return [...new Set(urls)];
+}
+
+function buildPropertyUrl(property) {
+    const path = property.DetailPageUrl || property.PropertyUrl || property.Url || null;
+    if (!path) return null;
+    if (path.startsWith('http')) return path;
+    return `https://search.savills.com${path.startsWith('/') ? '' : '/'}${path}`;
+}
+
+function toSnakeCaseKey(key) {
+    return String(key)
+        .replace(/([a-z0-9])([A-Z])/g, '$1_$2')
+        .replace(/[^a-zA-Z0-9]+/g, '_')
+        .replace(/^_+|_+$/g, '')
+        .toLowerCase();
+}
+
+function deepPrune(value) {
+    if (value === null || value === undefined) return undefined;
+
+    if (typeof value === 'string') {
+        return value.trim() ? value : undefined;
+    }
+
+    if (Array.isArray(value)) {
+        const cleanedArray = value
+            .map(item => deepPrune(item))
+            .filter(item => item !== undefined);
+        return cleanedArray.length > 0 ? cleanedArray : undefined;
+    }
+
+    if (typeof value === 'object') {
+        const cleanedObject = {};
+        for (const [key, nestedValue] of Object.entries(value)) {
+            const cleanedValue = deepPrune(nestedValue);
+            if (cleanedValue !== undefined) cleanedObject[key] = cleanedValue;
+        }
+        return Object.keys(cleanedObject).length > 0 ? cleanedObject : undefined;
+    }
+
+    return value;
+}
+
+function mapAllSourceFields(property) {
+    const output = {};
+
+    for (const [key, value] of Object.entries(property)) {
+        if (EXCLUDED_SOURCE_FIELDS.has(key)) continue;
+
+        const normalizedKey = toSnakeCaseKey(key);
+        const cleanedValue = deepPrune(value);
+
+        if (!normalizedKey || cleanedValue === undefined) continue;
+        output[normalizedKey] = cleanedValue;
+    }
+
+    return output;
+}
+
+function mapPropertyRecord(property) {
+    const availableSize = property.AvailableSize || {};
+    const sizeSqFt = availableSize?.SqFt ?? availableSize?.SquareFeet ?? null;
+    const sizeSqM = availableSize?.SqMt ?? availableSize?.SquareMeter ?? null;
+    const sizeText = property.SizeFormatted
+        || property.HeaderSizeFormatted
+        || property.FooterSizeFormatted
+        || (sizeSqFt ? `${Number(sizeSqFt).toLocaleString()} sq ft` : null)
+        || (sizeSqM ? `${Number(sizeSqM).toLocaleString()} sq m` : null);
+
+    const images = extractImageUrls(property);
+    const brochureUrls = extractBrochureUrls(property);
+    const price = property.DisplayPriceText
+        || property.GuidePriceText
+        || property.OriginalPriceText
+        || (property.Price ? `${property.DisplayCurrency || ''}${property.Price}` : null);
+
+    const agent = property.PrimaryAgent || {};
+
+    const mergedRecord = {
+        ...mapAllSourceFields(property),
+        id: property.PropertyID || property.ID || null,
+        external_id: property.ExternalPropertyID || null,
+        title: property.PropertyPageTitle || property.AddressLine1 || null,
+        price,
+        currency: property.DisplayCurrency || null,
+        address: [property.AddressLine1, property.AddressLine2].filter(Boolean).join(', ') || null,
+        city: extractCity(property),
+        country: extractCountry(property),
+        country_code: extractCountryCode(property),
+        latitude: property.Latitude || null,
+        longitude: property.Longitude || null,
+        size: sizeText || null,
+        size_sqft: sizeSqFt,
+        size_sqm: sizeSqM,
+        property_type: extractPropertyType(property),
+        market_types: Array.isArray(property.MarketTypes) ? property.MarketTypes : null,
+        status: property.PropertyStatusFlagTranslation || property.PropertyStatusFlag || null,
+        tenure: property.TenureType || property.TenureLeaseTypeDescription || null,
+        is_commercial: Boolean(property.IsCommercial),
+        is_sold: Boolean(property.IsSold),
+        image_url: images[0] || null,
+        images,
+        brochure_urls: brochureUrls,
+        description: extractDescription(property),
+        agent_name: agent.AgentName || agent.Name || null,
+        agent_phone: agent.AgentPhoneNumber || agent.Phone || null,
+        agent_office: agent.Office?.OfficeName || agent.OfficeName || null,
+        url: buildPropertyUrl(property),
+        scraped_at: new Date().toISOString(),
+    };
+
+    return deepPrune(mergedRecord) || {};
+}
+
+async function run() {
+    const input = await loadInputWithFallback();
+    const {
+        start_url,
+        results_wanted: resultsWantedRaw,
+        proxyConfiguration,
+    } = input;
+
+    if (!start_url || typeof start_url !== 'string' || !start_url.trim()) {
+        throw new Error('Missing required input: start_url');
+    }
+
+    const startUrl = start_url.trim();
+    const resultsWanted = sanitizeResultsWanted(resultsWantedRaw);
+    const getProxyUrl = await createProxyUrlFactory(proxyConfiguration);
+
+    log.info(`Savills API scraper started. Target: ${resultsWanted} properties`);
+    log.info(`Bootstrap URL: ${startUrl}`);
+
+    const html = await fetchText(startUrl, getProxyUrl);
+    const nextData = extractNextDataFromHtml(html);
+    const bootstrap = getApiBootstrapConfig(nextData, startUrl);
+
+    let saved = 0;
+    let page = 1;
+    let totalPages = Number.POSITIVE_INFINITY;
+    const seenKeys = new Set();
+    let apiPaginationFailed = false;
+
+    while (saved < resultsWanted && page <= totalPages) {
+        log.info(`Fetching API page ${page}${Number.isFinite(totalPages) ? `/${totalPages}` : ''}`);
+
+        let results;
+        try {
+            results = await fetchSearchPage(bootstrap, page, getProxyUrl);
+        } catch (error) {
+            log.error(`Failed to fetch API page ${page}: ${error.message}`);
+            apiPaginationFailed = true;
+            break;
+        }
+
+        if (!results?.Properties) {
+            log.warning('API response does not contain Properties. Stopping.');
+            apiPaginationFailed = true;
+            break;
+        }
+
+        const pageCount = extractPageCount(results);
+        if (pageCount) totalPages = pageCount;
+
+        const rows = toPropertyRows(results.Properties);
+        if (rows.length === 0) {
+            log.info('No rows found on this page. Stopping pagination.');
+            apiPaginationFailed = true;
+            break;
+        }
+
+        const added = await pushRowsToDataset(rows, resultsWanted, saved, seenKeys);
+        if (added > 0) {
+            saved += added;
+            log.info(`Saved ${added} properties. Total: ${saved}/${resultsWanted}`);
+        }
+
+        if (page >= totalPages) break;
+        page++;
+    }
+
+    if (saved < resultsWanted && apiPaginationFailed) {
+        saved = await runHtmlPaginationFallback({
+            startUrl,
+            nextData,
+            getProxyUrl,
+            resultsWanted,
+            saved,
+            seenKeys,
+        });
+    }
+
+    if (saved === 0) {
+        throw new Error('No properties extracted. Verify the start_url or enable proxyConfiguration for blocked regions.');
+    }
+
+    log.info(`Completed: ${saved} properties saved`);
+}
+
+try {
+    await run();
+} catch (error) {
+    log.error(`Actor failed: ${error.message}`);
+    throw error;
+} finally {
+    await Actor.exit();
+}
