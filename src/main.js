@@ -1,14 +1,15 @@
-import { Actor } from 'apify';
-import log from '@apify/log';
+import { readFile } from 'node:fs/promises';
+
+import { Actor, log } from 'apify';
 import { Dataset } from 'crawlee';
 import { gotScraping } from 'got-scraping';
-import { readFile } from 'node:fs/promises';
 
 await Actor.init();
 
 const DEFAULT_RESULTS_WANTED = 20;
 const API_PAGE_SIZE = 16;
 const REQUEST_TIMEOUT_MS = 30000;
+const DEFAULT_DATA_ENDPOINT = 'https://livev6-searchapi.savills.com';
 const EXCLUDED_SOURCE_FIELDS = new Set([
     'PropertyCardImagesGallery',
     'ImagesGallery',
@@ -111,6 +112,85 @@ async function fetchText(url, getProxyUrl) {
         },
     });
     return response.body;
+}
+
+function getSavillsUrlContext(startUrl) {
+    const parsedUrl = new URL(startUrl);
+    const pathParts = parsedUrl.pathname.split('/').filter(Boolean);
+    const countryCode = pathParts[0] || 'com';
+    const languageCode = pathParts[1] || 'en';
+
+    return {
+        countryCode,
+        languageCode,
+        relativePath: `/${pathParts.join('/')}`,
+        pathWithoutLocale: `/${pathParts.slice(2).join('/')}`,
+    };
+}
+
+function buildSearchByUrlCandidates(startUrl) {
+    const context = getSavillsUrlContext(startUrl);
+    const candidates = [
+        context.relativePath,
+        context.pathWithoutLocale,
+        context.pathWithoutLocale.replace(/^\/list\//, '/'),
+    ];
+
+    return {
+        ...context,
+        candidates: [...new Set(candidates.filter(value => value && value !== '/'))],
+    };
+}
+
+async function fetchSearchByUrl(startUrl, getProxyUrl) {
+    const { countryCode, languageCode, candidates } = buildSearchByUrlCandidates(startUrl);
+    const proxyUrl = await getProxyUrl();
+    let lastError = null;
+
+    for (const candidate of candidates) {
+        try {
+            const response = await gotScraping.post(`${DEFAULT_DATA_ENDPOINT}/Data/SearchByUrl`, {
+                proxyUrl,
+                responseType: 'json',
+                timeout: { request: REQUEST_TIMEOUT_MS },
+                headers: {
+                    Accept: 'application/json',
+                    'Content-Type': 'application/json',
+                    GpsLanguageCode: languageCode,
+                    GpsCountryCode: countryCode,
+                    Origin: 'https://search.savills.com',
+                    Referer: startUrl,
+                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:147.0) Gecko/20100101 Firefox/147.0',
+                },
+                json: { url: candidate },
+                throwHttpErrors: false,
+            });
+
+            if (response.statusCode >= 200 && response.statusCode < 300 && response.body?.Results?.Properties) {
+                const criteria = response.body.Results.SearchContext?.Criteria;
+                if (!criteria) {
+                    lastError = new Error(`SearchByUrl response had no reusable criteria for ${candidate}`);
+                    continue;
+                }
+
+                log.info(`Resolved search criteria via SearchByUrl: ${candidate}`);
+                return {
+                    dataEndpoint: DEFAULT_DATA_ENDPOINT,
+                    languageCode,
+                    countryCode,
+                    criteria,
+                    firstPageResults: response.body.Results,
+                    startUrl,
+                };
+            }
+
+            lastError = new Error(`SearchByUrl returned ${response.statusCode} for ${candidate}`);
+        } catch (error) {
+            lastError = error;
+        }
+    }
+
+    throw lastError || new Error('SearchByUrl did not return property results.');
 }
 
 function extractNextDataFromHtml(html) {
@@ -393,6 +473,7 @@ function extractCity(property) {
 
 function extractCountryCode(property) {
     if (property.GeoLocationCountryCode) return String(property.GeoLocationCountryCode).toUpperCase();
+    if (property.Tracking?.propertyCountry) return String(property.Tracking.propertyCountry).toUpperCase();
     return null;
 }
 
@@ -434,9 +515,12 @@ function extractPropertyType(property) {
 }
 
 function extractImageUrls(property) {
-    const gallery = Array.isArray(property.ImagesGallery) && property.ImagesGallery.length > 0
-        ? property.ImagesGallery
-        : (Array.isArray(property.PropertyCardImagesGallery) ? property.PropertyCardImagesGallery : []);
+    let gallery = [];
+    if (Array.isArray(property.ImagesGallery) && property.ImagesGallery.length > 0) {
+        gallery = property.ImagesGallery;
+    } else if (Array.isArray(property.PropertyCardImagesGallery)) {
+        gallery = property.PropertyCardImagesGallery;
+    }
 
     const urls = [];
     for (const image of gallery) {
@@ -458,7 +542,11 @@ function extractBrochureUrls(property) {
 }
 
 function buildPropertyUrl(property) {
-    const path = property.DetailPageUrl || property.PropertyUrl || property.Url || null;
+    const path = property.MetaInformation?.CanonicalUrl
+        || property.DetailPageUrl
+        || property.PropertyUrl
+        || property.Url
+        || null;
     if (!path) return null;
     if (path.startsWith('http')) return path;
     return `https://search.savills.com${path.startsWith('/') ? '' : '/'}${path}`;
@@ -588,9 +676,17 @@ async function run() {
     log.info(`Savills API scraper started. Target: ${resultsWanted} properties`);
     log.info(`Bootstrap URL: ${startUrl}`);
 
-    const html = await fetchText(startUrl, getProxyUrl);
-    const nextData = extractNextDataFromHtml(html);
-    const bootstrap = getApiBootstrapConfig(nextData, startUrl);
+    let nextData = null;
+    let bootstrap;
+
+    try {
+        bootstrap = await fetchSearchByUrl(startUrl, getProxyUrl);
+    } catch (error) {
+        log.warning(`SearchByUrl bootstrap failed: ${error.message}. Falling back to page bootstrap.`);
+        const html = await fetchText(startUrl, getProxyUrl);
+        nextData = extractNextDataFromHtml(html);
+        bootstrap = getApiBootstrapConfig(nextData, startUrl);
+    }
 
     let saved = 0;
     let page = 1;
@@ -602,12 +698,16 @@ async function run() {
         log.info(`Fetching API page ${page}${Number.isFinite(totalPages) ? `/${totalPages}` : ''}`);
 
         let results;
-        try {
-            results = await fetchSearchPage(bootstrap, page, getProxyUrl);
-        } catch (error) {
-            log.error(`Failed to fetch API page ${page}: ${error.message}`);
-            apiPaginationFailed = true;
-            break;
+        if (page === 1 && bootstrap.firstPageResults) {
+            results = bootstrap.firstPageResults;
+        } else {
+            try {
+                results = await fetchSearchPage(bootstrap, page, getProxyUrl);
+            } catch (error) {
+                log.error(`Failed to fetch API page ${page}: ${error.message}`);
+                apiPaginationFailed = true;
+                break;
+            }
         }
 
         if (!results?.Properties) {
@@ -636,7 +736,7 @@ async function run() {
         page++;
     }
 
-    if (saved < resultsWanted && apiPaginationFailed) {
+    if (saved < resultsWanted && apiPaginationFailed && nextData) {
         saved = await runHtmlPaginationFallback({
             startUrl,
             nextData,

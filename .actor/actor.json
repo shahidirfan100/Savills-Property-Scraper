@@ -1,8 +1,5 @@
 {
   "actorSpecification": 1,
-  "meta": {
-    "generatedBy": "GPT-5 Codex"
-  },
   "name": "savills-property-scraper",
   "title": "Savills Commercial Property Scraper",
   "version": "1.0",
