@@ -1,16 +1,114 @@
 {
   "title": "Savills Commercial Property Scraper",
-  "description": "Extract commercial properties for sale from Savills. Provide a Savills search URL with your desired filters applied.",
+  "description": "Extract commercial properties for sale from Savills. Provide a Savills search URL, or provide a location with optional property, price, bedroom, currency, and sorting filters.",
   "type": "object",
   "schemaVersion": 1,
   "properties": {
     "start_url": {
       "title": "Savills Search URL",
       "type": "string",
-      "description": "Savills search URL. Go to search.savills.com, apply your filters (location, property type, price), and paste the URL here.",
-      "editor": "textfield",
-      "prefill": "https://search.savills.com/com/en/list/commercial/property-for-sale/europe",
-      "default": "https://search.savills.com/com/en/list/commercial/property-for-sale/europe"
+      "description": "Optional complete Savills commercial property-for-sale search URL. Use this field or provide location and the filter fields below.",
+      "editor": "textfield"
+    },
+    "location": {
+      "title": "Location Path or Slug",
+      "type": "string",
+      "description": "Optional Savills location path, such as europe or england/london/london/ec3n. This replaces the location part of start_url. You can also provide a complete Savills search URL.",
+      "editor": "textfield"
+    },
+    "property_type": {
+      "title": "Commercial Property Type",
+      "type": "string",
+      "description": "Optional commercial property type filter.",
+      "enum": [
+        "development_land",
+        "industrial",
+        "leisure",
+        "office",
+        "hotel",
+        "healthcare",
+        "other_commercial",
+        "investment",
+        "serviced_office",
+        "retail"
+      ],
+      "enumTitles": [
+        "Development land",
+        "Industrial",
+        "Leisure",
+        "Office",
+        "Hotel",
+        "Healthcare",
+        "Other commercial",
+        "Investment",
+        "Serviced office",
+        "Retail"
+      ],
+      "editor": "select"
+    },
+    "min_price": {
+      "title": "Minimum Price",
+      "type": "number",
+      "description": "Optional minimum asking price in the selected currency.",
+      "minimum": 0,
+      "editor": "number"
+    },
+    "max_price": {
+      "title": "Maximum Price",
+      "type": "number",
+      "description": "Optional maximum asking price in the selected currency.",
+      "minimum": 0,
+      "editor": "number"
+    },
+    "currency": {
+      "title": "Price Currency",
+      "type": "string",
+      "description": "Optional three-letter currency code used for price filters and display, for example GBP, EUR, or USD.",
+      "enum": [
+        "GBP",
+        "EUR",
+        "USD",
+        "AED",
+        "AUD",
+        "CAD",
+        "CHF",
+        "CNY",
+        "DKK",
+        "HKD",
+        "JPY",
+        "NOK",
+        "NZD",
+        "PLN",
+        "SEK",
+        "SGD"
+      ],
+      "editor": "select"
+    },
+    "bedrooms": {
+      "title": "Exact Bedrooms",
+      "type": "integer",
+      "description": "Optional exact number of commercial bedrooms when published by Savills.",
+      "minimum": 0,
+      "editor": "number"
+    },
+
+    "sort_order": {
+      "title": "Sort Order",
+      "type": "string",
+      "description": "Optional result ordering.",
+      "enum": [
+        "most_recent",
+        "featured",
+        "price_low_to_high",
+        "price_high_to_low"
+      ],
+      "enumTitles": [
+        "Most recent",
+        "Featured properties",
+        "Lowest price first",
+        "Highest price first"
+      ],
+      "editor": "select"
     },
     "results_wanted": {
       "title": "Maximum Results",
@@ -27,11 +125,10 @@
       "description": "Use Apify Proxy for reliable scraping.",
       "editor": "proxy",
       "default": {
-        "useApifyProxy": true
+        "useApifyProxy": true,
+        "apifyProxyGroups": ["RESIDENTIAL"]
       }
     }
   },
-  "required": [
-    "start_url"
-  ]
+  "required": []
 }

@@ -1,20 +1,47 @@
 import { readFile } from 'node:fs/promises';
 
 import { Actor, log } from 'apify';
-import { Dataset } from 'crawlee';
-import { gotScraping } from 'got-scraping';
+import { Impit } from 'impit';
 
 await Actor.init();
 
 const DEFAULT_RESULTS_WANTED = 20;
-const API_PAGE_SIZE = 16;
+const BOOTSTRAP_PAGE_SIZE = 16;
+const API_PAGE_SIZE = 50;
+const MAX_CONCURRENT_PAGE_REQUESTS = 1;
 const REQUEST_TIMEOUT_MS = 30000;
+const API_REQUEST_TIMEOUT_MS = 45000;
+const BOOTSTRAP_TIMEOUT_MS = 10000;
+const MAX_RETRIES = 3;
+const MAX_BOOTSTRAP_ATTEMPTS = 1;
+const MAX_PAGE_RECOVERY_ATTEMPTS = 2;
+const MAX_DATASET_PUSH_ATTEMPTS = 3;
+const RETRY_BASE_DELAY_MS = 750;
+const RETRY_MAX_DELAY_MS = 5000;
 const DEFAULT_DATA_ENDPOINT = 'https://livev6-searchapi.savills.com';
 const EXCLUDED_SOURCE_FIELDS = new Set([
     'PropertyCardImagesGallery',
     'ImagesGallery',
     'BrochureGallery',
 ]);
+const COMMERCIAL_PROPERTY_TYPE_CODES = Object.freeze({
+    development_land: 'GRS_CPT_D',
+    industrial: 'GRS_CPT_I',
+    leisure: 'GRS_CPT_L',
+    office: 'GRS_CPT_O',
+    hotel: 'GRS_CPT_HO',
+    healthcare: 'GRS_CPT_H',
+    other_commercial: 'GRS_CPT_OC',
+    investment: 'GRS_CPT_IN',
+    serviced_office: 'GRS_CPT_SO',
+    retail: 'GRS_CPT_R',
+});
+const SORT_ORDER_CODES = Object.freeze({
+    featured: 'SO_FD',
+    most_recent: 'SO_PCDD',
+    price_low_to_high: 'SO_PA',
+    price_high_to_low: 'SO_PD',
+});
 
 const COUNTRY_MAP = {
     ES: 'Spain',
@@ -91,27 +118,248 @@ function sanitizeResultsWanted(rawValue) {
     return Math.max(1, Math.floor(parsed));
 }
 
-async function createProxyUrlFactory(proxyConfigurationInput) {
-    if (!proxyConfigurationInput) {
-        return async () => undefined;
+function sanitizeOptionalNumber(rawValue, fieldName, { integer = false } = {}) {
+    if (rawValue === undefined || rawValue === null || rawValue === '') return null;
+
+    const parsed = Number(rawValue);
+    if (!Number.isFinite(parsed) || parsed < 0 || (integer && !Number.isInteger(parsed))) {
+        log.warning(`Ignoring invalid ${fieldName} filter value: ${rawValue}`);
+        return null;
     }
 
-    const proxyConfiguration = await Actor.createProxyConfiguration({ ...proxyConfigurationInput });
-    return async () => proxyConfiguration.newUrl();
+    return parsed;
 }
 
-async function fetchText(url, getProxyUrl) {
-    const proxyUrl = await getProxyUrl();
-    const response = await gotScraping.get(url, {
-        proxyUrl,
-        timeout: { request: REQUEST_TIMEOUT_MS },
-        headers: {
-            Accept: 'text/html,application/xhtml+xml',
-            'Accept-Language': 'en-US,en;q=0.9',
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:147.0) Gecko/20100101 Firefox/147.0',
-        },
+function sanitizeOptionalCode(rawValue, fieldName, codes) {
+    if (rawValue === undefined || rawValue === null || rawValue === '') return null;
+
+    const normalized = String(rawValue).trim().toLowerCase();
+    if (!codes[normalized]) {
+        log.warning(`Ignoring unsupported ${fieldName} filter value: ${rawValue}`);
+        return null;
+    }
+
+    return codes[normalized];
+}
+
+function getFilterConfig(input) {
+    const minPrice = sanitizeOptionalNumber(input.min_price, 'min_price');
+    const maxPrice = sanitizeOptionalNumber(input.max_price, 'max_price');
+    const bedrooms = sanitizeOptionalNumber(input.bedrooms, 'bedrooms', { integer: true });
+
+    if (minPrice !== null && maxPrice !== null && minPrice > maxPrice) {
+        throw new Error('min_price cannot be greater than max_price');
+    }
+
+
+    const currency = input.currency === undefined || input.currency === null || input.currency === ''
+        ? null
+        : String(input.currency).trim().toUpperCase();
+    if (currency !== null && !/^[A-Z]{3}$/.test(currency)) {
+        log.warning(`Ignoring invalid currency filter value: ${input.currency}`);
+    }
+
+    const location = input.location === undefined || input.location === null
+        ? null
+        : String(input.location).trim();
+
+    return {
+        location: location || null,
+        minPrice,
+        maxPrice,
+        bedrooms,
+        currency: currency && /^[A-Z]{3}$/.test(currency) ? currency : null,
+        propertyType: sanitizeOptionalCode(input.property_type, 'property_type', COMMERCIAL_PROPERTY_TYPE_CODES),
+        sortOrder: sanitizeOptionalCode(input.sort_order, 'sort_order', SORT_ORDER_CODES),
+    };
+}
+
+function buildSearchUrlWithLocation(startUrl, location) {
+    if (!location) return startUrl || null;
+
+    if (/^https?:\/\//i.test(location)) {
+        try {
+            return new URL(location).toString();
+        } catch {
+            throw new Error(`Invalid location URL: ${location}`);
+        }
+    }
+
+    if (/[?#]/.test(location)) {
+        throw new Error('location must be a Savills path or slug without a query string');
+    }
+
+    const baseUrl = startUrl || 'https://search.savills.com/com/en/list/commercial/property-for-sale';
+    const parsedUrl = new URL(baseUrl);
+    const saleMarker = '/property-for-sale';
+    const markerIndex = parsedUrl.pathname.toLowerCase().indexOf(saleMarker);
+    if (markerIndex < 0) {
+        throw new Error('location requires a Savills property-for-sale search URL or a complete location URL');
+    }
+
+    const normalizedLocation = location.replace(/^\/+|\/+$/g, '');
+    if (!normalizedLocation) return startUrl;
+
+    parsedUrl.pathname = `${parsedUrl.pathname.slice(0, markerIndex + saleMarker.length)}/${normalizedLocation}`;
+    return parsedUrl.toString();
+}
+
+function applySearchFilters(criteria, filters) {
+    const updatedCriteria = { ...criteria };
+    let hasCriteriaFilters = false;
+
+    const setCriteriaValue = (key, value) => {
+        if (value === null || value === undefined) return;
+        updatedCriteria[key] = value;
+        hasCriteriaFilters = true;
+    };
+
+    setCriteriaValue('MinPrice', filters.minPrice);
+    setCriteriaValue('MaxPrice', filters.maxPrice);
+    setCriteriaValue('Currency', filters.currency);
+    setCriteriaValue('DisplayCurrency', filters.currency);
+    setCriteriaValue('CommercialPropertyType', filters.propertyType);
+    setCriteriaValue('SortOrder', filters.sortOrder);
+
+    if (filters.bedrooms !== null) {
+        setCriteriaValue('MinCommercialBedrooms', filters.bedrooms);
+        setCriteriaValue('MaxCommercialBedrooms', filters.bedrooms);
+    }
+
+    return { criteria: updatedCriteria, hasCriteriaFilters };
+}
+
+async function createProxyUrl(proxyConfigurationInput) {
+    if (!proxyConfigurationInput) return undefined;
+
+    try {
+        const proxyConfiguration = await Actor.createProxyConfiguration({ ...proxyConfigurationInput });
+        if (!proxyConfiguration || typeof proxyConfiguration.newUrl !== 'function') {
+            log.warning('Proxy configuration is unavailable. Continuing without a proxy.');
+            return undefined;
+        }
+
+        return await proxyConfiguration.newUrl();
+    } catch (error) {
+        log.warning(`Proxy configuration could not be initialized. Continuing without a proxy: ${error.message}`);
+        return undefined;
+    }
+}
+
+function createImpitClient(proxyUrl) {
+    return new Impit({
+        browser: 'chrome',
+        ignoreTlsErrors: true,
+        ...(proxyUrl && { proxyUrl }),
     });
-    return response.body;
+}
+
+function isRetryableStatus(status) {
+    return status === 408 || status === 425 || status === 429 || status >= 500;
+}
+
+function isRetryableError(error) {
+    const message = String(error?.message || error).toLowerCase();
+    return ['AbortError', 'TimeoutError'].includes(error?.name)
+        || /fetch failed|network|socket|timeout|timed out|aborted|deadline exceeded|connection reset|connection refused|dns/.test(message);
+}
+
+function getRetryAfterMs(response) {
+    const retryAfter = response?.headers?.get?.('retry-after');
+    if (!retryAfter) return null;
+
+    const seconds = Number(retryAfter);
+    if (Number.isFinite(seconds) && seconds >= 0) {
+        return Math.min(RETRY_MAX_DELAY_MS, seconds * 1000);
+    }
+
+    const retryAt = Date.parse(retryAfter);
+    if (!Number.isNaN(retryAt)) {
+        return Math.min(RETRY_MAX_DELAY_MS, Math.max(0, retryAt - Date.now()));
+    }
+
+    return null;
+}
+
+function getRetryDelayMs(response, attempt) {
+    const retryAfterMs = getRetryAfterMs(response);
+    if (retryAfterMs !== null) return retryAfterMs;
+
+    const backoff = Math.min(RETRY_MAX_DELAY_MS, RETRY_BASE_DELAY_MS * (2 ** (attempt - 1)));
+    return backoff + Math.floor(Math.random() * 250);
+}
+
+async function wait(ms) {
+    await new Promise(resolve => {
+        setTimeout(resolve, ms);
+    });
+}
+
+async function fetchWithTimeout(client, url, options = {}, timeoutMs = REQUEST_TIMEOUT_MS) {
+    const response = await client.fetch(url, {
+        ...options,
+        headers: {
+            ...options.headers,
+            // Savills CloudFront currently returns an encoding impit cannot decode reliably.
+            'Accept-Encoding': 'identity',
+        },
+        signal: AbortSignal.timeout(timeoutMs),
+    });
+    return response;
+}
+
+async function fetchWithRetry(
+    client,
+    url,
+    options = {},
+    description = url,
+    maxAttempts = MAX_RETRIES,
+    timeoutMs = REQUEST_TIMEOUT_MS,
+) {
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+        try {
+            const response = await fetchWithTimeout(client, url, options, timeoutMs);
+            if (!isRetryableStatus(response.status) || attempt === maxAttempts) return response;
+
+            const delayMs = getRetryDelayMs(response, attempt);
+            log.warning(`Retrying ${description} after HTTP ${response.status} in ${delayMs}ms (${attempt}/${maxAttempts})`);
+            await wait(delayMs);
+        } catch (error) {
+            if (attempt === maxAttempts || !isRetryableError(error)) throw error;
+
+            const delayMs = getRetryDelayMs(null, attempt);
+            log.warning(`Retrying ${description} after request error in ${delayMs}ms (${attempt}/${maxAttempts})`);
+            await wait(delayMs);
+        }
+    }
+
+    throw new Error(`Request retries exhausted for ${description}`);
+}
+
+async function fetchText(
+    client,
+    url,
+    maxAttempts = MAX_RETRIES,
+    timeoutMs = REQUEST_TIMEOUT_MS,
+) {
+    const response = await fetchWithRetry(
+        client,
+        url,
+        {},
+        `HTML page ${url}`,
+        maxAttempts,
+        timeoutMs,
+    );
+    if (!response.ok) throw new Error(`HTML page returned HTTP ${response.status}`);
+    return response.text();
+}
+
+async function parseJsonResponse(response, description) {
+    try {
+        return await response.json();
+    } catch (error) {
+        throw new Error(`${description} returned invalid JSON: ${error.message}`);
+    }
 }
 
 function getSavillsUrlContext(startUrl) {
@@ -120,11 +368,13 @@ function getSavillsUrlContext(startUrl) {
     const countryCode = pathParts[0] || 'com';
     const languageCode = pathParts[1] || 'en';
 
+    const query = parsedUrl.search;
+
     return {
         countryCode,
         languageCode,
-        relativePath: `/${pathParts.join('/')}`,
-        pathWithoutLocale: `/${pathParts.slice(2).join('/')}`,
+        relativePath: `/${pathParts.join('/')}${query}`,
+        pathWithoutLocale: `/${pathParts.slice(2).join('/')}${query}`,
     };
 }
 
@@ -132,7 +382,6 @@ function buildSearchByUrlCandidates(startUrl) {
     const context = getSavillsUrlContext(startUrl);
     const candidates = [
         context.relativePath,
-        context.pathWithoutLocale,
         context.pathWithoutLocale.replace(/^\/list\//, '/'),
     ];
 
@@ -142,51 +391,70 @@ function buildSearchByUrlCandidates(startUrl) {
     };
 }
 
-async function fetchSearchByUrl(startUrl, getProxyUrl) {
+async function fetchSearchByUrl(client, startUrl, createRecoveryClient) {
     const { countryCode, languageCode, candidates } = buildSearchByUrlCandidates(startUrl);
-    const proxyUrl = await getProxyUrl();
+    let activeClient = client;
     let lastError = null;
 
-    for (const candidate of candidates) {
+    for (let candidateIndex = 0; candidateIndex < candidates.length; candidateIndex++) {
+        const candidate = candidates[candidateIndex];
         try {
-            const response = await gotScraping.post(`${DEFAULT_DATA_ENDPOINT}/Data/SearchByUrl`, {
-                proxyUrl,
-                responseType: 'json',
-                timeout: { request: REQUEST_TIMEOUT_MS },
-                headers: {
-                    Accept: 'application/json',
-                    'Content-Type': 'application/json',
-                    GpsLanguageCode: languageCode,
-                    GpsCountryCode: countryCode,
-                    Origin: 'https://search.savills.com',
-                    Referer: startUrl,
-                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:147.0) Gecko/20100101 Firefox/147.0',
+            const response = await fetchWithRetry(
+                activeClient,
+                `${DEFAULT_DATA_ENDPOINT}/Data/SearchByUrl`,
+                {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                        GpsLanguageCode: languageCode,
+                        GpsCountryCode: countryCode,
+                        Origin: 'https://search.savills.com',
+                        Referer: startUrl,
+                    },
+                    body: JSON.stringify({ url: candidate }),
                 },
-                json: { url: candidate },
-                throwHttpErrors: false,
-            });
+                `SearchByUrl ${candidate}`,
+                MAX_BOOTSTRAP_ATTEMPTS,
+                BOOTSTRAP_TIMEOUT_MS,
+            );
 
-            if (response.statusCode >= 200 && response.statusCode < 300 && response.body?.Results?.Properties) {
-                const criteria = response.body.Results.SearchContext?.Criteria;
-                if (!criteria) {
-                    lastError = new Error(`SearchByUrl response had no reusable criteria for ${candidate}`);
-                    continue;
-                }
+            if (!response.ok) {
+                lastError = new Error(`SearchByUrl returned ${response.status} for ${candidate}`);
+                continue;
+            }
 
-                log.info(`Resolved search criteria via SearchByUrl: ${candidate}`);
-                return {
+            const responseBody = await parseJsonResponse(response, `SearchByUrl ${candidate}`);
+            if (!responseBody?.Results?.Properties) {
+                lastError = new Error(`SearchByUrl response had no property results for ${candidate}`);
+                continue;
+            }
+
+            const criteria = responseBody.Results.SearchContext?.Criteria;
+            if (!criteria) {
+                lastError = new Error(`SearchByUrl response had no reusable criteria for ${candidate}`);
+                continue;
+            }
+
+            log.info(`Resolved search criteria via SearchByUrl: ${candidate}`);
+            return {
+                bootstrap: {
                     dataEndpoint: DEFAULT_DATA_ENDPOINT,
                     languageCode,
                     countryCode,
                     criteria,
-                    firstPageResults: response.body.Results,
+                    firstPageResults: responseBody.Results,
                     startUrl,
-                };
-            }
-
-            lastError = new Error(`SearchByUrl returned ${response.statusCode} for ${candidate}`);
+                },
+                client: activeClient,
+            };
         } catch (error) {
             lastError = error;
+            // A second path cannot fix a connection timeout to the same API.
+            // Keep the alternate path for HTTP/path responses only.
+            if (candidateIndex < candidates.length - 1 && !isTemporaryRequestError(error)) {
+                log.warning(`Refreshing Impit session before the next SearchByUrl candidate (${candidateIndex + 1}/${candidates.length - 1})`);
+                activeClient = await createRecoveryClient();
+            }
         }
     }
 
@@ -220,36 +488,91 @@ function getApiBootstrapConfig(nextData, startUrl) {
         languageCode,
         countryCode,
         criteria,
+        firstPageResults: extractResultsFromNextData(nextData, 1),
         startUrl,
     };
 }
 
-async function fetchSearchPage(bootstrap, pageNumber, getProxyUrl) {
-    const proxyUrl = await getProxyUrl();
-    const response = await gotScraping.post(`${bootstrap.dataEndpoint}/Data/Search`, {
-        proxyUrl,
-        responseType: 'json',
-        timeout: { request: REQUEST_TIMEOUT_MS },
-        headers: {
-            Accept: 'application/json',
-            'Content-Type': 'application/json',
-            GpsLanguageCode: bootstrap.languageCode,
-            GpsCountryCode: bootstrap.countryCode,
-            Origin: 'https://search.savills.com',
-            Referer: bootstrap.startUrl,
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:147.0) Gecko/20100101 Firefox/147.0',
-        },
-        json: {
-            PagingParameters: {
-                CurrentPage: pageNumber,
-                PageSize: API_PAGE_SIZE,
-                ViewAll: false,
-            },
-            Criteria: bootstrap.criteria,
-        },
-    });
+async function fetchPageBootstrap(client, searchUrl) {
+    const html = await fetchText(
+        client,
+        searchUrl,
+        MAX_BOOTSTRAP_ATTEMPTS,
+        BOOTSTRAP_TIMEOUT_MS,
+    );
+    const nextData = extractNextDataFromHtml(html);
+    const bootstrap = getApiBootstrapConfig(nextData, searchUrl);
+    return { nextData, bootstrap };
+}
 
-    return response.body?.Results || null;
+async function fetchSearchPage(client, bootstrap, pageNumber) {
+    const response = await fetchWithRetry(
+        client,
+        `${bootstrap.dataEndpoint}/Data/Search`,
+        {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                GpsLanguageCode: bootstrap.languageCode,
+                GpsCountryCode: bootstrap.countryCode,
+                Origin: 'https://search.savills.com',
+                Referer: bootstrap.startUrl,
+            },
+            body: JSON.stringify({
+                PagingParameters: {
+                    CurrentPage: pageNumber,
+                    PageSize: API_PAGE_SIZE,
+                    ViewAll: false,
+                },
+                Criteria: bootstrap.criteria,
+            }),
+        },
+        `API page ${pageNumber}`,
+        MAX_RETRIES,
+        API_REQUEST_TIMEOUT_MS,
+    );
+
+    if (!response.ok) throw new Error(`API page returned HTTP ${response.status}`);
+
+    const responseBody = await parseJsonResponse(response, `API page ${pageNumber}`);
+    return responseBody?.Results || null;
+}
+
+function isTemporaryRequestError(error) {
+    const message = String(error?.message || error);
+    return isRetryableError(error)
+        || /HTTP (408|425|429|5\d\d)/.test(message)
+        || /returned invalid JSON/i.test(message);
+}
+
+async function fetchSearchPageWithRecovery(client, bootstrap, pageNumber, createRecoveryClient) {
+    let activeClient = client;
+    let lastError;
+
+    for (let attempt = 0; attempt <= MAX_PAGE_RECOVERY_ATTEMPTS; attempt++) {
+        try {
+            const results = await fetchSearchPage(activeClient, bootstrap, pageNumber);
+            return { results, client: activeClient };
+        } catch (error) {
+            lastError = error;
+            if (!isTemporaryRequestError(error) || attempt === MAX_PAGE_RECOVERY_ATTEMPTS) break;
+
+            log.warning(`Recovering API page ${pageNumber} with a fresh Impit session (${attempt + 1}/${MAX_PAGE_RECOVERY_ATTEMPTS})`);
+            activeClient = await createRecoveryClient();
+        }
+    }
+
+    throw lastError || new Error(`API page ${pageNumber} failed without an error`);
+}
+
+async function fetchApiPageForBatch(client, bootstrap, pageNumber, createRecoveryClient) {
+    try {
+        const pageResponse = await fetchSearchPageWithRecovery(client, bootstrap, pageNumber, createRecoveryClient);
+        return { pageNumber, ...pageResponse };
+    } catch (error) {
+        log.error(`Failed to fetch API page ${pageNumber}: ${error.message}. Keeping collected records.`);
+        return { pageNumber, error };
+    }
 }
 
 function extractPageCount(results) {
@@ -334,11 +657,23 @@ async function pushRowsToDataset(rows, resultsWanted, saved, seenKeys) {
 
     if (mappedRows.length === 0) return 0;
 
-    await Dataset.pushData(mappedRows);
-    return mappedRows.length;
+    for (let attempt = 1; attempt <= MAX_DATASET_PUSH_ATTEMPTS; attempt++) {
+        try {
+            await Actor.pushData(mappedRows);
+            return mappedRows.length;
+        } catch (error) {
+            if (attempt === MAX_DATASET_PUSH_ATTEMPTS || !isTemporaryRequestError(error)) throw error;
+
+            const delayMs = getRetryDelayMs(null, attempt);
+            log.warning(`Retrying dataset write in ${delayMs}ms (${attempt}/${MAX_DATASET_PUSH_ATTEMPTS})`);
+            await wait(delayMs);
+        }
+    }
+
+    return 0;
 }
 
-async function runHtmlPaginationFallback({ startUrl, nextData, getProxyUrl, resultsWanted, saved, seenKeys }) {
+async function runHtmlPaginationFallback({ startUrl, nextData, client, resultsWanted, saved, seenKeys }) {
     log.warning('Switching to HTML pagination fallback because API pagination failed.');
 
     let totalPages = Number.POSITIVE_INFINITY;
@@ -351,8 +686,13 @@ async function runHtmlPaginationFallback({ startUrl, nextData, getProxyUrl, resu
         if (page > 1) {
             const pageUrl = buildHtmlPageUrl(baseUrl, page);
             log.info(`Fetching HTML page ${page}${Number.isFinite(totalPages) ? `/${totalPages}` : ''}`);
-            const pageHtml = await fetchText(pageUrl, getProxyUrl);
-            currentNextData = extractNextDataFromHtml(pageHtml);
+            try {
+                const pageHtml = await fetchText(client, pageUrl);
+                currentNextData = extractNextDataFromHtml(pageHtml);
+            } catch (error) {
+                log.warning(`HTML fallback page ${page} could not be recovered: ${error.message}. Keeping collected records.`);
+                break;
+            }
         } else {
             log.info('Using bootstrap HTML page 1 for fallback extraction');
         }
@@ -665,28 +1005,59 @@ async function run() {
         proxyConfiguration,
     } = input;
 
-    if (!start_url || typeof start_url !== 'string' || !start_url.trim()) {
-        throw new Error('Missing required input: start_url');
-    }
-
-    const startUrl = start_url.trim();
+    const startUrl = typeof start_url === 'string' && start_url.trim() ? start_url.trim() : null;
     const resultsWanted = sanitizeResultsWanted(resultsWantedRaw);
-    const getProxyUrl = await createProxyUrlFactory(proxyConfiguration);
+    const filters = getFilterConfig(input);
+    const searchUrl = buildSearchUrlWithLocation(startUrl, filters.location);
+    if (!searchUrl) {
+        throw new Error('Provide either start_url or location to define a Savills search.');
+    }
+    const proxyUrl = await createProxyUrl(proxyConfiguration);
+    let client = createImpitClient(proxyUrl);
+    const createRecoveryClient = async () => createImpitClient(await createProxyUrl(proxyConfiguration));
 
     log.info(`Savills API scraper started. Target: ${resultsWanted} properties`);
-    log.info(`Bootstrap URL: ${startUrl}`);
+    log.info(`Bootstrap URL: ${searchUrl}`);
+    if (searchUrl !== startUrl) log.info(`Location filter resolved to: ${searchUrl}`);
 
     let nextData = null;
     let bootstrap;
 
     try {
-        bootstrap = await fetchSearchByUrl(startUrl, getProxyUrl);
-    } catch (error) {
-        log.warning(`SearchByUrl bootstrap failed: ${error.message}. Falling back to page bootstrap.`);
-        const html = await fetchText(startUrl, getProxyUrl);
-        nextData = extractNextDataFromHtml(html);
-        bootstrap = getApiBootstrapConfig(nextData, startUrl);
+        const pageBootstrap = await fetchPageBootstrap(client, searchUrl);
+        nextData = pageBootstrap.nextData;
+        bootstrap = pageBootstrap.bootstrap;
+        log.info('Resolved search criteria from page bootstrap.');
+    } catch (pageError) {
+        log.warning(`Page bootstrap failed: ${pageError.message}. Retrying with a fresh session.`);
+        try {
+            client = await createRecoveryClient();
+            const pageBootstrap = await fetchPageBootstrap(client, searchUrl);
+            nextData = pageBootstrap.nextData;
+            bootstrap = pageBootstrap.bootstrap;
+            log.info('Resolved search criteria from recovered page bootstrap.');
+        } catch (recoveredPageError) {
+            log.warning(`Recovered page bootstrap failed: ${recoveredPageError.message}. Trying SearchByUrl recovery.`);
+            try {
+                client = await createRecoveryClient();
+                const bootstrapResult = await fetchSearchByUrl(client, searchUrl, createRecoveryClient);
+                bootstrap = bootstrapResult.bootstrap;
+                client = bootstrapResult.client;
+            } catch (apiError) {
+                log.error(`Search bootstrap could not be recovered: ${apiError.message}. Ending with any collected records.`);
+                return;
+            }
+        }
     }
+
+    const appliedFilters = applySearchFilters(bootstrap.criteria, filters);
+    const canUseBootstrapPage = !appliedFilters.hasCriteriaFilters && resultsWanted <= BOOTSTRAP_PAGE_SIZE;
+    bootstrap = {
+        ...bootstrap,
+        criteria: appliedFilters.criteria,
+        startUrl: searchUrl,
+        ...(!canUseBootstrapPage && { firstPageResults: null }),
+    };
 
     let saved = 0;
     let page = 1;
@@ -694,53 +1065,88 @@ async function run() {
     const seenKeys = new Set();
     let apiPaginationFailed = false;
 
-    while (saved < resultsWanted && page <= totalPages) {
-        log.info(`Fetching API page ${page}${Number.isFinite(totalPages) ? `/${totalPages}` : ''}`);
-
-        let results;
-        if (page === 1 && bootstrap.firstPageResults) {
-            results = bootstrap.firstPageResults;
-        } else {
-            try {
-                results = await fetchSearchPage(bootstrap, page, getProxyUrl);
-            } catch (error) {
-                log.error(`Failed to fetch API page ${page}: ${error.message}`);
-                apiPaginationFailed = true;
-                break;
-            }
-        }
-
+    const processApiResults = async (pageNumber, results) => {
         if (!results?.Properties) {
-            log.warning('API response does not contain Properties. Stopping.');
+            log.warning(`API page ${pageNumber} does not contain Properties. Stopping pagination.`);
             apiPaginationFailed = true;
-            break;
+            return 'failed';
         }
 
         const pageCount = extractPageCount(results);
-        if (pageCount) totalPages = pageCount;
+        if (pageCount) totalPages = Math.min(totalPages, pageCount);
 
         const rows = toPropertyRows(results.Properties);
         if (rows.length === 0) {
-            log.info('No rows found on this page. Stopping pagination.');
-            apiPaginationFailed = true;
-            break;
+            log.info(`No rows found on API page ${pageNumber}. Stopping pagination.`);
+            return 'empty';
         }
 
         const added = await pushRowsToDataset(rows, resultsWanted, saved, seenKeys);
         if (added > 0) {
             saved += added;
-            log.info(`Saved ${added} properties. Total: ${saved}/${resultsWanted}`);
+            log.info(`Saved ${added} properties from API page ${pageNumber}. Total: ${saved}/${resultsWanted}`);
         }
 
-        if (page >= totalPages) break;
-        page++;
+        return 'saved';
+    };
+
+    while (saved < resultsWanted && page <= totalPages) {
+        if (page === 1 && bootstrap.firstPageResults) {
+            const pageState = await processApiResults(page, bootstrap.firstPageResults);
+            if (pageState !== 'saved' || page >= totalPages) break;
+            page++;
+            continue;
+        }
+
+        const pagesNeeded = Math.max(1, Math.ceil((resultsWanted - saved) / API_PAGE_SIZE));
+        const batchSize = Math.min(MAX_CONCURRENT_PAGE_REQUESTS, pagesNeeded);
+        const batchEnd = Math.min(page + batchSize - 1, totalPages);
+        const pagesToFetch = [];
+        for (let pageNumber = page; pageNumber <= batchEnd; pageNumber++) {
+            pagesToFetch.push(pageNumber);
+            log.info(`Fetching API page ${pageNumber}${Number.isFinite(totalPages) ? `/${totalPages}` : ''}`);
+        }
+
+        const pendingPageRequests = [];
+        for (const pageNumber of pagesToFetch) {
+            pendingPageRequests.push(fetchApiPageForBatch(client, bootstrap, pageNumber, createRecoveryClient));
+        }
+        const pageResponses = await Promise.all(pendingPageRequests);
+
+        for (const pageResponse of pageResponses) {
+            if (pageResponse.client && pageResponse.client !== client) {
+                client = pageResponse.client;
+                break;
+            }
+        }
+
+        let stopAtEmptyPage = false;
+        let stopAtFailedPage = false;
+        for (const pageResponse of pageResponses) {
+            if (pageResponse.error) {
+                apiPaginationFailed = true;
+                stopAtFailedPage = true;
+                break;
+            }
+
+            const pageState = await processApiResults(pageResponse.pageNumber, pageResponse.results);
+            if (pageState === 'empty') {
+                totalPages = Math.min(totalPages, pageResponse.pageNumber - 1);
+                stopAtEmptyPage = true;
+                break;
+            }
+            if (saved >= resultsWanted) break;
+        }
+
+        if (stopAtEmptyPage || stopAtFailedPage) break;
+        page = batchEnd + 1;
     }
 
     if (saved < resultsWanted && apiPaginationFailed && nextData) {
         saved = await runHtmlPaginationFallback({
-            startUrl,
+            startUrl: searchUrl,
             nextData,
-            getProxyUrl,
+            client,
             resultsWanted,
             saved,
             seenKeys,
@@ -748,7 +1154,8 @@ async function run() {
     }
 
     if (saved === 0) {
-        throw new Error('No properties extracted. Verify the start_url or enable proxyConfiguration for blocked regions.');
+        log.warning('No properties were saved. The search returned no matching records or the source was temporarily unavailable.');
+        return;
     }
 
     log.info(`Completed: ${saved} properties saved`);
