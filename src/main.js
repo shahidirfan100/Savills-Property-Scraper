@@ -11,7 +11,9 @@ const API_PAGE_SIZE = 50;
 const MAX_CONCURRENT_PAGE_REQUESTS = 1;
 const REQUEST_TIMEOUT_MS = 30000;
 const API_REQUEST_TIMEOUT_MS = 45000;
-const BOOTSTRAP_TIMEOUT_MS = 10000;
+// The search page is a large HTML document; 10s aborted intermittently and forced
+// unnecessary recovery. Match the normal request timeout instead.
+const BOOTSTRAP_TIMEOUT_MS = 30000;
 const MAX_RETRIES = 3;
 const MAX_BOOTSTRAP_ATTEMPTS = 1;
 const MAX_PAGE_RECOVERY_ATTEMPTS = 2;
@@ -19,6 +21,8 @@ const MAX_DATASET_PUSH_ATTEMPTS = 3;
 const RETRY_BASE_DELAY_MS = 750;
 const RETRY_MAX_DELAY_MS = 5000;
 const DEFAULT_DATA_ENDPOINT = 'https://livev6-searchapi.savills.com';
+// Mirrors the start_url schema default so an empty-input run still works.
+const DEFAULT_SEARCH_URL = 'https://search.savills.com/com/en/list/commercial/property-for-sale/europe';
 const EXCLUDED_SOURCE_FIELDS = new Set([
     'PropertyCardImagesGallery',
     'ImagesGallery',
@@ -249,19 +253,47 @@ async function createProxyUrl(proxyConfigurationInput) {
 function createImpitClient(proxyUrl) {
     return new Impit({
         browser: 'chrome',
+        // If the emulated Chrome TLS/profile is rejected by the target, retry with a
+        // vanilla user-agent instead of failing the request outright.
+        vanillaFallback: true,
         ignoreTlsErrors: true,
         ...(proxyUrl && { proxyUrl }),
     });
 }
+
+// Impit 0.14.5 throws typed errors (see its errors.js). Classify the transient
+// transport/timeout/body-integrity ones as retryable so a fresh session can heal them.
+const RETRYABLE_ERROR_NAMES = new Set([
+    'AbortError',
+    'TimeoutError',
+    'ConnectTimeout',
+    'ReadTimeout',
+    'WriteTimeout',
+    'PoolTimeout',
+    'NetworkError',
+    'ConnectError',
+    'ReadError',
+    'WriteError',
+    'CloseError',
+    'ProtocolError',
+    'LocalProtocolError',
+    'RemoteProtocolError',
+    'ProxyError',
+    'ProxyTunnelError',
+    'DecodingError',
+]);
 
 function isRetryableStatus(status) {
     return status === 408 || status === 425 || status === 429 || status >= 500;
 }
 
 function isRetryableError(error) {
+    if (RETRYABLE_ERROR_NAMES.has(error?.name)) return true;
+
     const message = String(error?.message || error).toLowerCase();
-    return ['AbortError', 'TimeoutError'].includes(error?.name)
-        || /fetch failed|network|socket|timeout|timed out|aborted|deadline exceeded|connection reset|connection refused|dns/.test(message);
+    return /fetch failed|network|socket|timeout|timed out|aborted|abort|deadline exceeded|connection reset|connection refused|connection closed|dns|econnreset|econnrefused|etimedout|error reading response stream|decompres/.test(
+        message,
+    );
 }
 
 function getRetryAfterMs(response) {
@@ -600,16 +632,39 @@ function extractPageState(nextData, pageNumber) {
     return pageMap[String(pageNumber)] || null;
 }
 
+// `__NEXT_DATA__` stores the page's property IDs in `pageState.propertyIds` and the
+// full records in `initialReduxState.properties`, keyed by ID. Resolve those IDs into
+// the property objects the mapper expects; fall back to `results.Properties` otherwise.
+function resolveNextDataPropertyRows(nextData, pageState) {
+    const propertyStore = nextData?.props?.initialReduxState?.properties;
+    if (!propertyStore || typeof propertyStore !== 'object') return null;
+
+    const ids = Array.isArray(pageState?.propertyIds) ? pageState.propertyIds : null;
+    if (!ids || ids.length === 0) return null;
+
+    const rows = [];
+    for (const id of ids) {
+        const property = propertyStore[id] || propertyStore[String(id)];
+        if (property && typeof property === 'object') rows.push(property);
+    }
+
+    return rows.length > 0 ? rows : null;
+}
+
 function extractResultsFromNextData(nextData, pageNumber) {
     const pageState = extractPageState(nextData, pageNumber) || getFirstPageState(nextData);
+    if (!pageState) return null;
+
     const results = pageState?.results || null;
-    if (!results?.Properties) return null;
+    const properties = resolveNextDataPropertyRows(nextData, pageState) || results?.Properties || null;
+    if (!properties) return null;
 
     const pageCount = Number(pageState?.paging?.total);
-    const pageInfo = results.PagingInfo || {};
+    const pageInfo = results?.PagingInfo || {};
 
     return {
-        ...results,
+        ...(results || {}),
+        Properties: properties,
         PagingInfo: {
             ...pageInfo,
             PageCount: Number.isFinite(pageCount) && pageCount > 0 ? pageCount : pageInfo.PageCount,
@@ -1008,9 +1063,12 @@ async function run() {
     const startUrl = typeof start_url === 'string' && start_url.trim() ? start_url.trim() : null;
     const resultsWanted = sanitizeResultsWanted(resultsWantedRaw);
     const filters = getFilterConfig(input);
-    const searchUrl = buildSearchUrlWithLocation(startUrl, filters.location);
+    let searchUrl = buildSearchUrlWithLocation(startUrl, filters.location);
     if (!searchUrl) {
-        throw new Error('Provide either start_url or location to define a Savills search.');
+        // Documented product default; matches the start_url schema default. Applied only
+        // when the caller supplied no start_url or location search mode.
+        log.warning('No start_url or location supplied. Using the default Europe commercial sale search.');
+        searchUrl = DEFAULT_SEARCH_URL;
     }
     const proxyUrl = await createProxyUrl(proxyConfiguration);
     let client = createImpitClient(proxyUrl);
@@ -1018,7 +1076,7 @@ async function run() {
 
     log.info(`Savills API scraper started. Target: ${resultsWanted} properties`);
     log.info(`Bootstrap URL: ${searchUrl}`);
-    if (searchUrl !== startUrl) log.info(`Location filter resolved to: ${searchUrl}`);
+    if (filters.location) log.info(`Location filter resolved to: ${searchUrl}`);
 
     let nextData = null;
     let bootstrap;
@@ -1051,7 +1109,16 @@ async function run() {
     }
 
     const appliedFilters = applySearchFilters(bootstrap.criteria, filters);
-    const canUseBootstrapPage = !appliedFilters.hasCriteriaFilters && resultsWanted <= BOOTSTRAP_PAGE_SIZE;
+    // Only trust the embedded first page when it actually carries property rows. A
+    // degraded bootstrap can return criteria with an empty Properties payload; in that
+    // case fall through to the paginated API instead of ending with an empty dataset.
+    const hasBootstrapRows = toPropertyRows(bootstrap.firstPageResults?.Properties).length > 0;
+    const canUseBootstrapPage = !appliedFilters.hasCriteriaFilters
+        && resultsWanted <= BOOTSTRAP_PAGE_SIZE
+        && hasBootstrapRows;
+    if (!canUseBootstrapPage && !appliedFilters.hasCriteriaFilters && resultsWanted <= BOOTSTRAP_PAGE_SIZE) {
+        log.warning('Page bootstrap returned no property rows. Using the paginated API instead.');
+    }
     bootstrap = {
         ...bootstrap,
         criteria: appliedFilters.criteria,
@@ -1161,11 +1228,13 @@ async function run() {
     log.info(`Completed: ${saved} properties saved`);
 }
 
+let exitCode = 0;
 try {
     await run();
 } catch (error) {
     log.error(`Actor failed: ${error.message}`);
-    throw error;
+    exitCode = 1;
 } finally {
-    await Actor.exit();
+    // A runtime failure must surface as a failed run, not a successful empty exit.
+    await Actor.exit({ exitCode });
 }

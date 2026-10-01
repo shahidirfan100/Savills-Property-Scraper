@@ -64,7 +64,8 @@ The real request replaces the `Criteria` placeholder with the complete object re
 
 - `408`, `425`, `429`, and `5xx` responses are retried; other non-2xx responses are passed to the fallback or completion logic.
 - Network errors, connection resets, timeouts, aborts, and invalid JSON payloads are treated as temporary page failures.
-- The page bootstrap uses a 10-second timeout. API pages use a 45-second timeout because the verified 50-record response can exceed 30 seconds through a residential proxy.
+- The page bootstrap uses a 30-second timeout. A 10-second bound aborted the ~750 KB search page intermittently, forcing avoidable recovery. API pages use a 45-second timeout because the verified 50-record response can exceed 30 seconds through a residential proxy.
+- The page bootstrap is only used for the first page when its embedded `Properties` payload actually contains rows; otherwise the actor falls through to the paginated API so a degraded bootstrap cannot end the run with an empty dataset.
 - An API request is attempted up to three times with bounded backoff. A failed API page can then be retried with up to two fresh Impit sessions.
 - A successful page is validated for `Results.Properties` before rows are saved.
 - Rows are pushed after each page, and stable property identifiers prevent duplicates across recovery or HTML fallback paths.
@@ -95,6 +96,8 @@ The real request replaces the `Criteria` placeholder with the complete object re
 - iOS Safari and Android Chrome discovery both returned the same page bootstrap data and did not expose a richer or independently paginated API.
 - `Map/Search` was inspected but rejected because it is viewport/map oriented and does not expose stable dataset pagination.
 - Direct local Impit probing of `SearchByUrl` was attempted with the exact contract above. The Windows probe was reset by the remote host before receiving a response, so it is not counted as a successful live probe. Local actor runs still completed through page bootstrap and `Data/Search`.
+- Impit `0.14.5` was verified against the live endpoints. The `chrome` browser profile is valid for this version. `Accept-Encoding: identity` remains required: the Savills JSON API returns a compressed body that Impit `0.14.5` fails to decompress (`DecodingError` in `response.text()`), while `identity` returns valid JSON. The Savills search page bootstrap succeeds with or without the override, and it is sent with `identity` for consistency.
+- `0.14.5` throws typed errors (`TimeoutError`, `ConnectTimeout`, `NetworkError`, `RemoteProtocolError`, `DecodingError`, and related classes). The retry classifier keys on those error names so transport, timeout, proxy, and body-integrity failures are retried with a bounded fresh session.
 
 ## Response Coverage
 - Field model: columnar arrays under `Results.Properties`

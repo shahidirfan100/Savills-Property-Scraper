@@ -7,8 +7,10 @@
     "start_url": {
       "title": "Savills Search URL",
       "type": "string",
-      "description": "Optional complete Savills commercial property-for-sale search URL. Use this field or provide location and the filter fields below.",
-      "editor": "textfield"
+      "description": "Complete Savills commercial property-for-sale search URL. Defaults to a Europe commercial sale search when omitted. Use this field or provide location and the filter fields below.",
+      "editor": "textfield",
+      "prefill": "https://search.savills.com/com/en/list/commercial/property-for-sale/europe",
+      "default": "https://search.savills.com/com/en/list/commercial/property-for-sale/europe"
     },
     "location": {
       "title": "Location Path or Slug",
@@ -116,7 +118,6 @@
       "description": "Maximum number of properties to extract.",
       "minimum": 1,
       "default": 20,
-      "prefill": 20,
       "editor": "number"
     },
     "proxyConfiguration": {

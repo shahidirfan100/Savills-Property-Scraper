@@ -57,7 +57,7 @@ Additional source fields may be included when Savills provides them. These can i
 1. Open this Actor on Apify and provide a public Savills search URL in `start_url`, or use a Savills location path in `location`.
 2. Optionally set price, currency, property type, bedroom, and sorting filters in the input form.
 3. Set `results_wanted` to the maximum number of properties to save.
-4. Enable or configure Apify Proxy when you need additional reliability for larger or region-sensitive runs.
+4. Apify Proxy is enabled by default for reliability; adjust `proxyConfiguration` if you need a different proxy or want to run without one.
 5. Start the run and review the dataset preview.
 6. Download the results or connect the dataset to your workflow.
 
@@ -67,7 +67,7 @@ Use either `start_url` or `location` to define the search. Optional Actor filter
 
 | Parameter | Type | Required | Default | Description |
 |-----------|------|----------|---------|-------------|
-| `start_url` | String | No | - | Complete Savills commercial property-for-sale search URL; use this or `location` |
+| `start_url` | String | No | Europe commercial sale search URL | Complete Savills commercial property-for-sale search URL; use this or `location` |
 | `location` | String | No | - | Savills location path or slug, such as `europe` or `england/london/london/ec3n`; can also be a complete Savills search URL |
 | `property_type` | Enum | No | - | `development_land`, `industrial`, `leisure`, `office`, `hotel`, `healthcare`, `other_commercial`, `investment`, `serviced_office`, or `retail` |
 | `min_price` | Number | No | - | Minimum asking price in the selected currency |
@@ -76,9 +76,9 @@ Use either `start_url` or `location` to define the search. Optional Actor filter
 | `bedrooms` | Integer | No | - | Exact number of commercial bedrooms when published by Savills |
 | `sort_order` | Enum | No | Savills search default | `most_recent`, `featured`, `price_low_to_high`, or `price_high_to_low` |
 | `results_wanted` | Integer | No | `20` | Maximum number of properties to collect; minimum is `1` |
-| `proxyConfiguration` | Object | No | Disabled | Optional Apify Proxy configuration for the run |
+| `proxyConfiguration` | Object | No | Apify Proxy (residential) | Apify Proxy configuration for the run |
 
-Provide either `start_url` or `location`. If both are supplied, `start_url` defines the base search and `location` replaces its location path. Explicit filter inputs take priority over the same criteria encoded in the URL.
+Provide either `start_url` or `location`. If neither is supplied, the Actor runs the default Europe commercial sale search. If both are supplied, `start_url` defines the base search and `location` replaces its location path. Explicit filter inputs take priority over the same criteria encoded in the URL.
 
 ## Usage Examples
 
